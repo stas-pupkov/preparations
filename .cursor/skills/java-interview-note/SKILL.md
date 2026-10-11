@@ -11,9 +11,10 @@ description: >-
 # Java Interview Note
 
 Превращает исходный конспект вопросов/ответов в полноценную учебную заметку для
-senior-подготовки — в стиле:
-`src/main/java/ru/stas/pupkov/preparations/oop/oop.md`.
-`src/main/java/ru/stas/pupkov/preparations/jvm/jvm.md`.
+senior-подготовки — в стиле уже существующих заметок `src/main/java/ru/stas/pupkov/preparations/...`. Например:
+`src/main/java/ru/stas/pupkov/preparations/oop/oop.md`
+или
+`src/main/java/ru/stas/pupkov/preparations/jvm/jvm.md`
 
 Соблюдай также workspace-правило Java/Spring Tutor (пути разделов, `code/`, md только
 после разрешения пользователя).
