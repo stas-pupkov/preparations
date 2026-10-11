@@ -11,16 +11,17 @@ description: >-
 # Java Interview Note
 
 Превращает исходный конспект вопросов/ответов в полноценную учебную заметку для
-senior-подготовки — в стиле эталона:
+senior-подготовки — в стиле:
 `src/main/java/ru/stas/pupkov/preparations/oop/oop.md`.
+`src/main/java/ru/stas/pupkov/preparations/jvm/jvm.md`.
 
 Соблюдай также workspace-правило Java/Spring Tutor (пути разделов, `code/`, md только
 после разрешения пользователя).
 
 ## Когда применять
 
-Пользователь просит обработать тему/файл из interview-репозитория или сделать заметку
-«как по ООП». Типичные источники: `https://github.com/enhorse/java-interview` (`*.md` в корне).
+Пользователь просит обработать тему/файл из interview-репозитория или сделать заметку. 
+Типичные источники: `https://github.com/enhorse/java-interview` (`*.md` в корне).
 
 ## Workflow
 
@@ -63,13 +64,14 @@ senior/staff. Не рецензия на исходник и не «конспе
 
 - Язык заметки — **русский**.
 - Уровень — **senior**: нюансы, контракты, механика, антипаттерны; без «очевидных» вводных.
-- Принятые англицизмы оставлять. Формат первого упоминания:
+- Принятые англицизмы оставлять. Формат первого упоминания — **сначала русский**,
+  затем английский в скобках:
 
-  `LSP (Liskov Substitution Principle, принцип подстановки Барбары Лисков)`
+  `Принцип подстановки Барбары Лисков (Liskov Substitution Principle, LSP)`
 
-  Дальше по заметке — только `LSP` (или другой англицизм) без повторного перевода.
-  То же для getter/setter, DI, God-object, override/overload, runtime/compile-time,
-  fragile base class, Template Method, sealed, DTO, use-case и т.п.
+  Дальше по заметке — только англицизм (`LSP`, `DI`, `override` …) без повторного перевода.
+  То же для getter/setter, God-object, overload, runtime/compile-time, fragile base class,
+  Template Method, sealed, DTO, use-case и т.п.
 - Ключевые слова и API Java не переводить (`interface`, `extends`, `invokevirtual`).
 - Имена демо-классов и пакетов — на английском.
 
