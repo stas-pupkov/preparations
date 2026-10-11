@@ -17,8 +17,9 @@ Java 17+. Заметка для изучения и подготовки к со
 11. [Синхронизация и только для чтения](#11-синхронизация-и-только-для-чтения)
 12. [Сложность и выбор коллекций](#12-сложность-и-выбор-коллекций)
 13. [Практика и полезные приёмы](#13-практика-и-полезные-приёмы)
-14. [Демо-код](#14-демо-код)
-15. [Вопросы для собеседования и ответы](#15-вопросы-для-собеседования-и-ответы)
+14. [Null в коллекциях](#14-null-в-коллекциях)
+15. [Демо-код](#15-демо-код)
+16. [Вопросы для собеседования и ответы](#16-вопросы-для-собеседования-и-ответы)
 
 ---
 
@@ -781,7 +782,100 @@ Set<K> keys = new HashSet<>(map.keySet());
 
 ---
 
-## 14. Демо-код
+## 14. Null в коллекциях
+
+Единого правила «коллекции принимают / не принимают `null`» нет. Это контракт
+конкретной реализации. На собесе и в проде важно знать таблицу и типичные ловушки.
+
+### Кто принимает `null`
+
+| Структура | Элемент / ключ / значение |
+|-----------|---------------------------|
+| `ArrayList`, `LinkedList`, `Vector` | элементы — да, сколько угодно |
+| `CopyOnWriteArrayList` | да |
+| `HashSet`, `LinkedHashSet` | один `null` (как один `null`-ключ в `HashMap`) |
+| `HashMap`, `LinkedHashMap`, `IdentityHashMap` | один `null`-ключ; значений `null` — сколько угодно |
+| `WeakHashMap` | `null`-ключ поддерживается (sentinel); `null`-значения — да |
+| `TreeMap` | ключ `null` при natural ordering — **нет**; значение `null` — да |
+| `Hashtable` | ключи и значения — **нет** |
+| `ConcurrentHashMap`, `ConcurrentSkipListMap` | ключи и значения — **нет** |
+| `TreeSet`, `PriorityQueue`, `ArrayDeque`, `EnumSet` | **нет** (обычно NPE) |
+
+`LinkedList` как `List`/`Deque` `null` принимает; использовать его как очередь с `null`
+внутри — плохая идея (см. ниже).
+
+### Хитрые моменты
+
+**1. `get` вернул `null` — ключа нет или значение было `null`?**
+
+```java
+map.put("a", null);
+map.get("a"); // null — значение есть
+map.get("b"); // null — ключа нет
+```
+
+Различить: `containsKey(...)`. Именно из‑за этой двусмысленности `ConcurrentHashMap`
+запрещает `null` (в многопотоке нельзя надёжно отличить «нет ключа» от «value == null»).
+
+**2. Фабрики Java 9+ жёстче старых**
+
+```java
+Collections.singletonList(null); // ок
+List.of(null);                   // NPE
+Set.of(null);                    // NPE
+Map.of("k", null);               // NPE
+Arrays.asList((String) null);    // ок
+```
+
+**3. `TreeSet` / `TreeMap` и сравнение**
+
+При natural ordering (`Comparable`) `null` нельзя → NPE.  
+С `Comparator`, который умеет `null` (`nullsFirst` / `nullsLast`), `null`-ключ/элемент
+может быть допустим. По умолчанию считать «нельзя».
+
+Уникальность в `TreeSet` определяется через `compare` / `compareTo`, не только через
+`equals`.
+
+**4. Очереди и `null`**
+
+`ArrayDeque` и `PriorityQueue` бросают NPE на `null`.  
+У `Queue` методы `poll()` / `peek()` возвращают `null`, если очередь пуста. Если положить
+`null` в `LinkedList`-очередь, «пусто» и «вынули null» не отличить. Спека `Queue` как раз
+поэтому обычно запрещает `null` как элемент.
+
+**5. `remove(null)` vs `remove(int)`**
+
+```java
+list.remove(null);                 // поиск по equals(null)
+list.remove(1);                    // это remove(int index)!
+list.remove(Integer.valueOf(1));   // удаление по значению
+```
+
+С `null` индексной перегрузки нет, но с числами путаница классическая.
+
+**6. Сортировка**
+
+```java
+Collections.sort(list); // NPE, если в списке есть null
+list.sort(Comparator.nullsLast(Comparator.naturalOrder()));
+```
+
+**7. Повторный `HashSet.add(null)`**
+
+Вернёт `false` — обычное правило `Set` для дубликата, не «особый null».
+
+### Практическое правило
+
+- Однопоточный map и нужен `null` в value → `HashMap` ок, всегда думайте про `containsKey`.
+- Многопоточный map → `ConcurrentHashMap`; «нет значения» моделируйте отдельно (нет ключа,
+  sentinel, свой тип результата) — не через `null`.
+- Сортированные структуры → без `null` или явный null-safe `Comparator`.
+- Очередь / стек → `ArrayDeque`, без `null`.
+- На границе API часто лучше пустая коллекция, чем `null`-поле, и без `null` внутри.
+
+---
+
+## 15. Демо-код
 
 | Файл | Что разбирает |
 |------|----------------|
@@ -793,7 +887,7 @@ Set<K> keys = new HashSet<>(map.keySet());
 
 ---
 
-## 15. Вопросы для собеседования и ответы
+## 16. Вопросы для собеседования и ответы
 
 ### 1. Почему `Map` не является `Collection`?
 
@@ -1003,3 +1097,24 @@ O(log n).
 | «TreeSet по возрастанию» | Балансировка RB-дерева |
 
 Хороший ответ часто начинается с уточнения сценария, а не с угадывания одного слова.
+
+### 25. Какие коллекции принимают `null`, а какие нет?
+
+См. таблицу в [разделе 14](#14-null-в-коллекциях). Коротко:
+
+- списки (`ArrayList`, `LinkedList`) и `HashMap`/`HashSet` — в основном да;
+- `TreeSet`, `PriorityQueue`, `ArrayDeque`, `ConcurrentHashMap`, `Hashtable`, `EnumSet` —
+  нет (NPE);
+- у `TreeMap` нельзя `null`-ключ при natural ordering, `null`-value можно.
+
+### 26. Почему ConcurrentHashMap запрещает `null`, а HashMap — нет?
+
+У `HashMap.get(key)` `null` означает и «ключа нет», и «значение было null». В однопотоке
+это разруливают через `containsKey`. В concurrent-сценарии такая двусмысленность опасна и
+дорога; `ConcurrentHashMap` просто запрещает `null` для ключей и значений.
+
+### 27. Чем `List.of(null)` отличается от `Collections.singletonList(null)`?
+
+`singletonList(null)` — валидный неизменяемый список из одного `null`.  
+`List.of(null)` (и `Set.of` / `Map.of` с null) — сразу `NPE`. Фабрики Java 9+ жёстче к
+`null`, чем старые `Collections.*`.
