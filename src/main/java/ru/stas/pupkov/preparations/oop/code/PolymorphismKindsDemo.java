@@ -44,17 +44,17 @@ public class PolymorphismKindsDemo {
     public static void main(String[] args) {
         System.out.println("--- subtype (runtime) ---");
         Painter shape = new Circle();
-        System.out.println(shape.draw());
+        System.out.println(shape.draw()); //circle
         shape = new Square();
-        System.out.println(shape.draw());
+        System.out.println(shape.draw()); //square
 
         System.out.println("--- ad hoc / overload (compile-time) ---");
-        System.out.println(describe(42));
-        System.out.println(describe("x"));
+        System.out.println(describe(42)); //int:42
+        System.out.println(describe("x")); //string:x
 
         System.out.println("--- parametric / generics ---");
         List<Object> bag = new ArrayList<>();
         addTwice(bag, "item");
-        System.out.println(bag);
+        System.out.println(bag); // [item, item]
     }
 }

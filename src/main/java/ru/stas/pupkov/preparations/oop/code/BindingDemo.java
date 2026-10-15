@@ -58,9 +58,9 @@ public class BindingDemo {
 
         System.out.println("--- early binding (тип ссылки) ---");
         ref.staticMethod();   // Animal.staticMethod — static не полиморфен
-        ref.finalMethod();    // final — не переопределяется
-        ref.say("hello");     // overload выбирается на compile-time
-        System.out.println(ref.kind); // поля тоже по типу ссылки → Animal.field
+        ref.finalMethod();    // Animal.finalMethod — не переопределяется
+        ref.say("hello");     // Animal.say(String): hello. overload выбирается на compile-time
+        System.out.println(ref.kind); // Animal.field, поля тоже по типу ссылки
 
         System.out.println("--- late binding (тип объекта) ---");
         ref.sound();          // Dog.sound — override через dynamic dispatch

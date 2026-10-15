@@ -624,7 +624,53 @@ Map<K, V> ro = Collections.unmodifiableMap(map);
 
 Это view: изменение исходной коллекции будет видно; прямые мутации через view дают
 `UnsupportedOperationException`. С Java 9+ удобны ещё `List.of` / `Set.of` / `Map.of` —
-неизменяемые копии с фиксированным содержимым.
+неизменяемые коллекции с фиксированным содержимым (элементы задаются аргументами фабрики).
+
+### `List.copyOf` / `Set.copyOf` / `Map.copyOf` (Java 10+)
+
+Снимок существующей коллекции в неизменяемый вид:
+
+```java
+List<String> snapshot = List.copyOf(items);
+Set<String>  setCopy  = Set.copyOf(items);
+Map<K, V>    mapCopy  = Map.copyOf(map);
+```
+
+Поведение `List.copyOf(coll)`:
+
+- возвращает **unmodifiable** `List` с элементами `coll` в порядке итерации;
+- правки исходной коллекции **не** отражаются в результате (это копия содержимого списка,
+  не view);
+- `coll == null` или любой элемент `null` → `NullPointerException`;
+- копия **поверхностная**: mutable-элементы общие с оригиналом — их изменение видно в обоих;
+- мутации через снимок (`add` / `remove` / `set`) → `UnsupportedOperationException`.
+
+Какую ссылку возвращает: обычно **новый** экземпляр internal immutable-list JDK. Если
+аргумент уже unmodifiable list без `null` (результат `List.of` / предыдущего `copyOf`),
+OpenJDK **часто возвращает ту же ссылку**. На `==` в контракте API опираться нельзя —
+фабрика вольна создать новый объект или переиспользовать существующий.
+
+```java
+List<String> a = List.of("x", "y");
+List<String> b = List.copyOf(a);
+System.out.println(a == b); // обычно true
+
+List<String> mutable = new ArrayList<>(List.of("x", "y"));
+List<String> copy = List.copyOf(mutable);
+System.out.println(mutable == copy); // false
+```
+
+Сравнение:
+
+| | `Collections.unmodifiableList(list)` | `List.copyOf(list)` | `new ArrayList<>(list)` |
+|--|--------------------------------------|---------------------|-------------------------|
+| Связь с исходником | view — правки `list` видны | независимый снимок | независимая mutable-копия |
+| Мутации через результат | запрещены | запрещены | разрешены |
+| `null`-элементы | допускаются, если были в `list` | запрещены (NPE) | допускаются |
+
+Типичный кейс encapsulation: не `return items`, а `return List.copyOf(items)` — клиент не
+получает ссылку на внутреннее mutable-хранилище и не ломает инварианты через `clear()` /
+`add(null)`.
 
 ```java
 List<Integer> empty = Collections.emptyList();

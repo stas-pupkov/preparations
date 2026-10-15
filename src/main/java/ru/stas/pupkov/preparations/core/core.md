@@ -37,8 +37,7 @@ Java 17+. Заметка для изучения и подготовки к со
 | **JDK** (Java Development Kit) | Компилятор, инструменты, библиотеки для *разработки* |
 
 С Java 11 отдельно поставляемый «классический» JRE почти исчез из практики: ставят JDK
-и при необходимости собирают runtime через `jlink`. На собеседовании достаточно:
-JDK ⊃ runtime ⊃ JVM; детали HotSpot — в [`jvm.md`](../jvm/jvm.md).
+и при необходимости собирают runtime через `jlink`. Детали HotSpot — в [`jvm.md`](../jvm/jvm.md).
 
 ### `main`
 
@@ -245,7 +244,7 @@ class Child extends Parent {
 
 ```java
 final class Money {                 // нельзя extends
-    private final BigDecimal amount; // blank final → только в ctor/init
+    private final BigDecimal amount; // blank final → только в конструкторе/init
 
     Money(BigDecimal amount) {
         this.amount = Objects.requireNonNull(amount);
@@ -299,7 +298,7 @@ abstract class Shape {
 
 ## 5. Классы, конструкторы, порядок инициализации
 
-### Виды типов (практическая таксономия)
+### Виды типов
 
 - top-level: обычный / `abstract` / `final`;
 - `interface`, `enum`, `record` (14/16), `annotation`;
@@ -318,42 +317,55 @@ final class User {
         this.email = Objects.requireNonNull(email);
     }
 
-    User(User other) {                           // copy constructor
+    User(User other) {                           // конструктор копирования
         this(other.id, other.email);
     }
 
-    static User of(String id, String email) {    // factory поверх private/packaged ctor
+    static User of(String id, String email) {    // factory поверх private/packaged конструктора
         return new User(id, email);
     }
 }
-
-final class Utils {
-    private Utils() { }                          // non-instantiable
-}
 ```
 
-- **Default constructor** — генерируется, только если своих конструкторов нет.
-- `private` ctor: utility, controlled factory, доступ для nested.
+- **Конструктор по умолчанию (default constructor)** — генерируется, только если своих
+  конструкторов нет.
+- `private` конструктор: utility, controlled factory, доступ для nested.
 
 ### Порядок инициализации
+
+`<clinit>` — специальный метод JVM для **инициализации класса** (class initialization;
+имя от **cl**ass **init**ializer). В исходниках его не пишут: `javac` сам собирает в один
+`<clinit>` все `static { ... }` блоки и инициализаторы static-полей
+(`static int x = compute();`).
+
+| | `<clinit>` | конструктор (`<init>` в байткоде) |
+|--|------------|-----------------------------------|
+| Когда | при **первой** инициализации **класса** | при каждом `new` **экземпляра** |
+| Сколько раз | обычно **один раз** на `Class` (на loader) | на каждый объект |
+| Что инициализирует | static-состояние | instance-состояние |
+
+Запускается не при простой загрузке класса, а при **active use** (первый доступ к
+static-полю/методу, `new` и т.п.). `Class.forName(name, false, loader)` может загрузить
+класс **без** `<clinit>`. Подробнее про фазы жизненного цикла класса — в заметке JVM.
 
 ```java
 class Parent {
     static { System.out.println("1 Parent.<clinit>"); }
     { System.out.println("3 Parent instance"); }
-    Parent() { System.out.println("4 Parent ctor"); }
+    Parent() { System.out.println("4 Parent конструктор"); }
 }
 
 class Child extends Parent {
     static { System.out.println("2 Child.<clinit>"); }
     { System.out.println("5 Child instance"); }
-    Child() { System.out.println("6 Child ctor"); }
+    Child() { System.out.println("6 Child конструктор"); }
 }
 
 // new Child() → 1, 2, 3, 4, 5, 6  (static — один раз при первой инициализации класса)
 ```
 
-Ошибка в static init → `ExceptionInInitializerError`; дальше часто `NoClassDefFoundError`.
+Ошибка в static init / `<clinit>` → `ExceptionInInitializerError`; класс «сломан» для
+этого loader’а, дальше часто `NoClassDefFoundError`.
 Ошибка в instance init — исключение из конструктора, объект «недосоздан».
 
 Демо: [ClassInitOrderDemo.java](code/ClassInitOrderDemo.java).
@@ -363,9 +375,9 @@ class Child extends Parent {
 ## 6. Override, overload, сокрытие static
 
 | | Override | Overload | Static same name |
-|--|----------|----------|------------------|
+|--|---------|----------|------------------|
 | Когда выбирается | runtime (тип объекта) | compile-time (типы аргументов) | compile-time (тип ссылки) |
-| Сигнатура | та же (covariant return ок) | другое число/типы параметров | та же — это **hiding**, не override |
+| Сигнатура | та же | другое число/типы параметров | та же — это **hiding**, не override |
 | `@Override` | ловит ошибки | не применим | не должен «проходить» как override |
 
 ```java
@@ -402,6 +414,19 @@ class Cat extends Animal {
     }
 }
 ```
+
+**Covariant return** (ковариантный возвращаемый тип, Java 5+) — при override можно вернуть
+**более узкий** тип, чем у метода в суперклассе. «Ковариантность» здесь: направление
+подтипов **сохраняется** — если `Dog` <: `Animal`, return может сузиться с `Animal` до
+`Dog` (как в примере `self()` выше).
+
+Клиент с типом `Dog` получает `Dog` без каста (`Dog same = d.self()`). Через ссылку
+`Animal` контракт базы тот же: результат виден как `Animal`, в runtime это всё равно
+`Dog`. На уровне JVM часто генерируется **bridge method**: синтетический
+`Animal self()` в `Dog`, который вызывает `Dog self()`.
+
+Сузить **параметры** так нельзя — это уже не override, а overload
+(`void feed(Dog d)` не переопределяет `void feed(Animal a)`).
 
 Правила override: visibility не сужать; return — тот же или covariant; смена параметров →
 overload; checked `throws` можно сузить/убрать, нельзя добавить несовместимое checked.
@@ -554,7 +579,7 @@ GC, Metaspace, коллекторы — [`jvm.md` §5, §8](../jvm/jvm.md).
 
 ### Свойства `String`
 
-- `final` класс, содержимое immutable (с Java 9 — compact strings: Latin-1 / UTF-16 в `byte[]`).
+- `final` класс, содержимое immutable.
 - `hashCode` кэшируется после первого вычисления — удобный ключ `HashMap`.
 - Сравнение: `==` — identity; `equals` — содержимое (и только оно нужно в бизнес-коде).
 
@@ -589,17 +614,24 @@ System.out.println(a.equals(c));         // true
 | Java 7+ | **Java heap** | GC собирает недостижимые interned-строки |
 | Java 8+ | heap; PermGen удалён | **Metaspace ≠ string pool** (там metadata классов) |
 
-Для Java 17 на собесе достаточно: *пул в heap с Java 7; Metaspace тут ни при чём*.
-Уточнение senior-уровня: сама StringTable — структура VM (не «ещё один `HashMap` в
-heap»); **полезный груз** — объекты `String` в heap. Лимит/давление — через heap и
-размер таблицы (`-XX:StringTableSize=` — степень двойки, размер buckets; смотреть
-доки конкретной JDK).
+Краткий ответ на собесе (Java 17): **с Java 7 пул строк в heap; Metaspace к нему
+не относится** (там metadata классов, не интернированные строки).
 
-Связь с classfile: литералы лежат в **constant pool** класса (в `.class` / runtime
-constant pool). При первом разрешении `ldc` JVM кладёт/находит соответствующий
-`String` в string pool. Constant pool класса и string pool — разные вещи: первый
-принадлежит типу (metadata + resolved entries), второй — глобальная дедупликация
-строк процесса.
+Чуть точнее (senior): «пул» — это не просто «ещё один `HashMap` в heap». Внутри JVM
+есть **StringTable** (служебная хеш-таблица HotSpot). В ней хранятся ссылки, а сами
+объекты `String` лежат в **heap** — именно они занимают память, которую видит GC.
+Нехватка памяти → давление на heap; размер таблицы настраивается
+`-XX:StringTableSize=` (обычно степень двойки — число buckets; точные правила — в
+доках конкретной JDK).
+
+Откуда берутся литералы вроде `"hello"`: в `.class`-файле они записаны в
+**constant pool класса** (таблица констант этого типа; в runtime — runtime constant
+pool). Когда код первый раз выполняет загрузку такой константы (байткод `ldc`), JVM
+кладёт или находит тот же `String` в **string pool**. Это **две разные структуры**:
+
+- constant pool класса — «записная книжка» конкретного типа (его константы);
+- string pool — общий для всего процесса механизм «одна и та же строка → один
+  канонический объект `String`».
 
 ### Как строка попадает в пул
 
@@ -809,6 +841,78 @@ try (InputStream in = Files.newInputStream(path);
 
 `finally` не выполнится при `System.exit` / `halt` / крахе JVM. Ресурс — `AutoCloseable`.
 
+### Suppressed exceptions
+
+**Suppressed exception** — исключение, которое **не вылетело наружу само**, а
+**прикреплено** к другому (primary) через `Throwable.addSuppressed`. Достаётся через
+`getSuppressed()`. Появилось в Java 7 вместе с try-with-resources: чтобы сбой в
+`close()` не **затирал** исходную ошибку из тела `try` (как часто бывало с `finally`).
+
+Старый антипаттерн — наружу уходит только `close`, ошибка чтения «пропала»:
+
+```java
+InputStream in = open();
+try {
+    throw new IOException("read failed");
+} finally {
+    in.close(); // тоже IOException → маскирует read failed
+}
+```
+
+С try-with-resources primary — исключение из **тела try**, сбой `close` становится
+**suppressed**:
+
+```java
+try (TraceResource r = new TraceResource("r", /* failOnClose */ true)) {
+    throw new IOException("work failed");
+} catch (IOException ex) {
+    System.out.println("primary: " + ex.getMessage());      // work failed
+    for (Throwable s : ex.getSuppressed()) {
+        System.out.println("suppressed: " + s.getMessage()); // close failed...
+    }
+}
+```
+
+Несколько ресурсов — `close` в **обратном** порядке открытия; каждый упавший `close`
+может добавить свой suppressed. В стектрейсе они видны блоком `Suppressed:`.
+
+Если тело `try` прошло без ошибки, а упал только `close` — наружу идёт исключение
+**close**, suppressed нет (некому «подавлять»).
+
+Можно добавить вручную (эмуляция TWR):
+
+```java
+Exception primary = null;
+try {
+    doWork();
+} catch (Exception e) {
+    primary = e;
+    throw e;
+} finally {
+    try {
+        cleanup();
+    } catch (Exception cleanupEx) {
+        if (primary != null) {
+            primary.addSuppressed(cleanupEx);
+        } else {
+            throw cleanupEx;
+        }
+    }
+}
+```
+
+У части `Throwable` suppression отключается конструктором — тогда `addSuppressed`
+ничего не копит.
+
+Не путать с cause:
+
+| | `getCause()` | `getSuppressed()` |
+|--|--------------|-------------------|
+| Смысл | «из-за чего» (цепочка причин) | «ещё упало рядом, пока доставляли primary» |
+| Связь | причинно-следственная | «сиблинги» (try vs close) |
+
+В логах смотри и cause, и `getSuppressed()` — иначе потеряешь сбой закрытия ресурса.
+
 OOM: `Java heap space`, `Metaspace` (не PermGen), `GC overhead limit exceeded` —
 детали в [`jvm.md`](../jvm/jvm.md).
 
@@ -838,7 +942,7 @@ Object value = field.get(instance);
 
 Generics (обобщения) — параметрический полиморфизм на этапе компиляции: один код
 работает с разными типами аргументов, а проверки типов делает `javac`, а не касты
-в runtime. Введены в Java 5; реализация — **type erasure** (JLS §4.6): в байткоде
+в runtime. Введены в Java 5; реализация — **type erasure**: в байткоде
 остаются raw-типы, границы и вставленные cast’ы.
 
 ### 14.1. Синтаксис: типы и методы
@@ -861,14 +965,11 @@ static <T> T first(List<T> list) {
     return list.isEmpty() ? null : list.get(0);
 }
 
-// constructor
+// конструктор
 class Pair<A, B> {
     Pair(A a, B b) { }
 }
 ```
-
-Diamond (`<>`, Java 7+): `Map<String, List<Integer>> m = new HashMap<>();`.
-С Java 9 — diamond и в anonymous class при выводимом контексте (ограниченно).
 
 ### 14.2. Variance: ковариантность, контравариантность, инвариантность
 
@@ -1238,7 +1339,7 @@ G1 string deduplication ≠ `intern()` (шаринг `byte[]`, не identity).
 ### 9. Порядок инициализации класса и экземпляра?
 
 Сначала `<clinit>` иерархии (static поля/блоки от Object-ward к классу). При `new` —
-`super` ctor chain, затем instance-поля/блоки, затем тело конструктора. Ошибка в static →
+цепочка конструкторов `super`, затем instance-поля/блоки, затем тело конструктора. Ошибка в static →
 `ExceptionInInitializerError`, класс остаётся broken. Демо: [ClassInitOrderDemo.java](code/ClassInitOrderDemo.java).
 
 ### 10. Когда `finally` не выполнится? Что с `return` в `finally`?

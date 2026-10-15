@@ -2,7 +2,7 @@ package ru.stas.pupkov.preparations.core.code;
 
 /**
  * Порядок инициализации: superclass {@code <clinit>} → subclass {@code <clinit>} →
- * superclass instance fields/blocks → superclass ctor → subclass instance → subclass ctor.
+ * superclass instance fields/blocks → superclass конструктор → subclass instance → subclass конструктор.
  *
  * <p>Ошибка в static-инициализаторе → {@link ExceptionInInitializerError}.
  */
@@ -18,7 +18,7 @@ public class ClassInitOrderDemo {
         }
 
         Parent() {
-            System.out.println("4 Parent ctor");
+            System.out.println("4 Parent конструктор");
         }
     }
 
@@ -36,7 +36,7 @@ public class ClassInitOrderDemo {
         }
 
         Child() {
-            System.out.println("6 Child ctor");
+            System.out.println("6 Child конструктор");
         }
 
         private static int printStatic(String msg) {
