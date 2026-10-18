@@ -264,11 +264,45 @@ void addBook(Book book) {
 `CascadeType.ALL` + `orphanRemoval = true` уместны, когда коллекция — часть **агрегата**
 (lifecycle ребёнка совпадает с родителем: строки заказа).
 
-На shared reference (`Order → User`) cascade ALL опасен: можно удалить/permanently
-затронуть чужую сущность.
+На shared reference (`Order → User`) cascade ALL / orphanRemoval опасны: можно удалить
+чужую сущность из БД.
 
-`orphanRemoval = true`: удаление элемента из коллекции → `DELETE` строки (для корректно
-настроенной bidirectional/owning семантики). Это не то же самое, что «просто убрать из List».
+#### За что отвечает `orphanRemoval`
+
+`orphanRemoval = true` на связи (чаще `@OneToMany` / `@OneToOne`): если ребёнок
+**отвязан от родителя** (убрали из коллекции / обнулили ссылку), JPA должен сделать
+`DELETE` строки в БД — ребёнок стал «сиротой» относительно агрегата и не остаётся в таблице.
+
+```java
+@OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+private List<OrderLine> lines = new ArrayList<>();
+
+order.getLines().remove(line); // после flush/commit → DELETE order_line
+```
+
+Без `orphanRemoval` то же `remove` из списка — не «магия удаления»: часто только
+разрыв связи (FK → `NULL` или только изменение в памяти — зависит от owning side).
+Это сильнее, чем «убрать из `List`» в Java: политика **удаления строки**.
+
+#### `orphanRemoval` vs `CascadeType.REMOVE`
+
+| | `orphanRemoval` | `CascadeType.REMOVE` |
+|--|-----------------|----------------------|
+| Когда | ребёнка **убрали** из коллекции/ссылки родителя | удалили **родителя** (`em.remove(order)`) |
+| Смысл | «выпал из агрегата → DELETE» | «удалили корень → каскадом DELETE детей» |
+
+Часто ставят вместе для агрегата: дети живут только внутри родителя.
+
+#### Практика
+
+- Уместно: `Order` → `OrderLine`, компоненты агрегата без самостоятельной жизни.
+- Не уместно: `Order` → `User` / `Product` (shared) — `remove` из коллекции удалит
+  пользователя/товар.
+- Нужна корректная bidirectional-синхронизация (owning side с FK), иначе провайдер может
+  не увидеть orphan.
+- SQL уходит на **flush** persistence context, не мгновенно в момент `list.remove`.
+
+Демо: [OrphanRemovalDemo.java](code/OrphanRemovalDemo.java).
 
 Fetch type по умолчанию (JPA): коллекции — `LAZY`; `@ManyToOne` / `@OneToOne` — `EAGER`.
 В практике `@ManyToOne` часто делают `LAZY` явно.
@@ -313,15 +347,63 @@ Session/EM живёт на весь HTTP request. Jackson может трога�
 - N+1 прячется в сериализации;
 - границы загрузки размазаны по view.
 
-В Spring Boot OSIV historically включён по умолчанию; на проде его обычно выключают
-и фиксируют fetch на service boundary.
+В Spring Boot OSIV исторически включён по умолчанию.
 
 ### 6.4. Пагинация + `join fetch` коллекции
 
-JOIN размножает строки родителя → `setFirstResult` / `setMaxResults` (LIMIT/OFFSET)
-применяется к неправильному набору. Обходы: два запроса (страница id → fetch graph by ids),
-subselect/window, отдельный count-query. Hibernate может требовать
-`hibernate.query.fail_on_pagination_over_collection_fetch=true` как защиту.
+Хочется одним запросом: страницу родителей (`ORDER BY` + `LIMIT`/`OFFSET`) и их
+коллекции без N+1 (`join fetch`). На практике это конфликтует.
+
+```java
+@Query("select o from Order o join fetch o.items order by o.created desc")
+Page<Order> page(Pageable pageable);
+```
+
+SQL по смыслу такой:
+
+```sql
+SELECT o.*, i.*
+FROM orders o
+JOIN order_item i ON i.order_id = o.id
+ORDER BY o.created DESC
+LIMIT 10 OFFSET 0;  -- режет строки JOIN, не «10 заказов»
+```
+
+#### Почему ломается
+
+JOIN размножает строку родителя по числу детей. Пример: order 1 → 3 items, order 2 → 1,
+order 3 → 2 → в результате 6 строк. `LIMIT 2` может вернуть только две строки первого
+заказа → Hibernate соберёт **один** `Order` с обрезанной коллекцией; второго заказа на
+«странице из 2» не будет.
+
+Последствия:
+
+- меньше родителей, чем просили в `page size`;
+- у попавших коллекция может быть неполной;
+- `Page.totalElements` / count по тому же join считают строки join, а не distinct order.
+
+Hibernate: `hibernate.query.fail_on_pagination_over_collection_fetch=true` — лучше упасть,
+чем тихо отдать кривую страницу.
+
+`select distinct o … join fetch` убирает дубли entity **после** загрузки; SQL `LIMIT`
+часто всё равно режет размноженный join. `distinct` ≠ «LIMIT по уникальным order_id».
+
+Важна именно **collection** fetch (`@OneToMany` / `@ManyToMany`). `join fetch` to-one
+(`o.customer`) родителя по числу детей так не размножает — с пагинацией обычно совместим.
+
+#### Обходы
+
+1. **Два запроса** (типичный прод-паттерн):
+   - `SELECT id FROM orders WHERE … ORDER BY … LIMIT/OFFSET` — страница id;
+   - `SELECT o FROM Order o JOIN FETCH o.items WHERE o.id IN :ids ORDER BY …` — граф;
+   - count — отдельный, **без** fetch коллекции.
+2. Page/slice **без** collection fetch → items вторым запросом (`IN` / `@BatchSize`).
+3. Окно / subquery на SQL (native, JOOQ, Blaze-Persistence) — сначала id страницы, потом join.
+
+В Spring Data `Pageable` + `@Query` с `join fetch` коллекции — классическая ловушка:
+на данных «у каждого ровно 1 child» может «случайно работать», на реальных — нет.
+
+Демо: [PaginationJoinFetchDemo.java](code/PaginationJoinFetchDemo.java).
 
 ---
 
@@ -413,17 +495,99 @@ Proxy Hibernate: `instanceof` / `getClass()` vs `Hibernate.getClass` / pattern m
 
 ## 10. Кэши: L1 и L2
 
+```text
+find(id)
+  → L1 (persistence context)     — всегда, один Session/EM
+  → L2 (second-level cache)      — опционально, shared между Session
+  → БД
+```
+
+Рядом, но отдельно: **query cache** — кэш результатов запросов (обычно список id).
+
 | Кэш | Область | Что хранит |
 |-----|---------|------------|
-| First level (PC) | один EntityManager / Session | instances entity |
-| Second level | shared across sessions (нужен provider) | данные entity по id |
+| L1 / First level (PC) | один EntityManager / Session | Java instances (managed) |
+| L2 / Second level | shared across sessions (нужен provider) | disassembled state по id |
 | Query cache | shared | id'шники результата запроса |
 
-Query cache без L2 для entity часто бесполезен: по id всё равно идут в БД.
-L2 имеет смысл на read-mostly справочниках; на часто меняющихся агрегатах —
-риск stale + стоимость инвалидации. Ассоциации и collection cache усложняют модель.
+### 10.1. L1 — persistence context
 
-Включать L2 «для скорости всего приложения» без профиля — типичная ошибка.
+Обязательная часть unit of work, не «выключаемый Redis внутри Hibernate»:
+
+- живёт, пока жив EM/Session (часто = `@Transactional`);
+- identity map: один id → один instance в этом PC;
+- dirty checking, cascade, flush.
+
+```java
+Product a = em.find(Product.class, 1L); // SELECT или hit L1
+Product b = em.find(Product.class, 1L); // без SQL, a == b
+```
+
+| Свойство | Смысл |
+|----------|--------|
+| Область | только этот Session |
+| Согласованность | сильная в TX (видны свои незакоммиченные изменения) |
+| После commit / `clear` / close | L1 пуст; объекты detached |
+| Выключить | нельзя — без L1 нет нормального JPA UoW |
+
+Огромные выборки в одной TX раздувают L1 → память и долгий flush; пачками `clear` или
+`StatelessSession` / JDBC.
+
+См. также [§4](#4-persistence-context-и-lifecycle) и [EntityLifecycleDemo.java](code/EntityLifecycleDemo.java).
+
+### 10.2. L2 — second-level cache
+
+Опциональный кэш **между** Session (JVM / кластер через Ehcache, Caffeine, Redis-регион…).
+
+- Хранит не те же Java-объекты, а **состояние** entity по id; при hit гидрируется
+  новый managed instance в **текущий** L1.
+- Нужны конфигурация + обычно `@Cacheable` / регион на entity.
+
+```java
+@Cacheable
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+@Entity
+class Country { ... } // типичный кандидат — справочник
+```
+
+| Strategy (идея) | Когда |
+|-----------------|--------|
+| `READ_ONLY` | почти не меняется |
+| `NONSTRICT_READ_WRITE` | редкие апдейты, допустим краткий stale |
+| `READ_WRITE` | обычные обновления |
+| `TRANSACTIONAL` | редко; нужен подходящий provider / JTA |
+
+Точная семантика зависит от cache provider. После UPDATE регион обычно инвалидируется
+или обновляется; при ошибках конфигурации / нескольких узлах без distributed cache —
+риск stale.
+
+**Уместно:** read-mostly справочники, частый `find` по id, измеримый hit-rate.  
+**Вредно:** горячие агрегаты (`Order`, балансы); «L2 на все entity»; тяжёлый collection
+cache без нужды; несколько инстансов приложения с локальным L2 без общей инвалидации.
+
+### 10.3. Query cache
+
+```text
+JPQL → query cache: список id → каждый id через L2 (или БД)
+```
+
+Без L2 обычно бесполезен: кэшируются id, entity всё равно грузятся из БД. Инвалидация
+грубая (завязана на обновления таблиц) → часто низкий hit-rate.
+
+### 10.4. L1 vs L2
+
+| | L1 | L2 |
+|--|----|----|
+| Включён | всегда | опционально |
+| Область | один Session | shared |
+| Содержимое | Java instances | данные по id |
+| Роль | UoW, identity, dirty checking | ускорить чтения across TX |
+| Согласованность | сильная в TX | по стратегии региона |
+
+Фраза на собес: L1 — обязательный PC per-session; L2 — опциональный shared cache entity
+по id для read-mostly; query cache без L2 почти бессмысленен.
+
+Демо: [FirstSecondLevelCacheDemo.java](code/FirstSecondLevelCacheDemo.java).
 
 ---
 
@@ -483,9 +647,12 @@ Spring Data **JDBC** — отдельная модель (без lazy PC JPA); �
 | [JdbcPreparedStatementSemanticsDemo.java](code/JdbcPreparedStatementSemanticsDemo.java) | concatenation vs bind; batch mental model |
 | [EntityLifecycleDemo.java](code/EntityLifecycleDemo.java) | состояния entity, identity map, flush/clear |
 | [AssociationOwningSideDemo.java](code/AssociationOwningSideDemo.java) | owning vs inverse; почему FK не пишется |
+| [OrphanRemovalDemo.java](code/OrphanRemovalDemo.java) | orphanRemoval vs CascadeType.REMOVE; DELETE сироты |
 | [NPlusOneFetchDemo.java](code/NPlusOneFetchDemo.java) | 1+N vs join fetch vs IN-batch |
+| [PaginationJoinFetchDemo.java](code/PaginationJoinFetchDemo.java) | LIMIT по JOIN ≠ страница родителей; паттерн id→fetch |
 | [EntityEqualsHashCodePitfallDemo.java](code/EntityEqualsHashCodePitfallDemo.java) | HashSet + generated id |
 | [OptimisticLockVersionDemo.java](code/OptimisticLockVersionDemo.java) | `UPDATE … WHERE version`; конфликт TX |
+| [FirstSecondLevelCacheDemo.java](code/FirstSecondLevelCacheDemo.java) | L1 hit vs L2 hit vs DB; разные Session |
 
 Демо моделируют семантику в JVM без реального драйвера/Hibernate Session — для контрактов.
 Поведение провайдера и СУБД сверяют по логам SQL и документации версии.
@@ -530,7 +697,17 @@ Identity map гарантирует: один id → один instance в PC. Б
 не меняет. Заполнили только `author.books` — в БД `author_id` может остаться `NULL`.
 Синхронизацию обеих сторон делают в доменных методах.
 
-### 6. Как объяснить и устранить N+1?
+### 6. За что отвечает `orphanRemoval`? Чем отличается от `CascadeType.REMOVE`?
+
+`orphanRemoval = true`: отвязка ребёнка от родителя (remove из коллекции / null на
+ссылке) → при flush `DELETE` строки-сироты. `CascadeType.REMOVE`: удалили родителя →
+каскадный `DELETE` детей. Это разные оси. Уместно на агрегате (`OrderLine`); опасно на
+shared (`User`, `Product`). Не путать с «просто убрали из `List`» без orphanRemoval —
+в БД строка может остаться.
+
+Демо: [OrphanRemovalDemo.java](code/OrphanRemovalDemo.java).
+
+### 7. Как объяснить и устранить N+1?
 
 Симптом: 1 запрос корня + N запросов ассоциации при обходе. Детект: SQL-логи,
 datasource-proxy, Hibernate statistics. Фиксить под use-case: `join fetch` / entity graph,
@@ -538,35 +715,40 @@ batch-size/`IN`, DTO-проекция, иногда два явных запро
 не лечение, а перенос стоимости на каждый `find`. OSIV маскирует проблему, перенося
 lazy-load в сериализацию.
 
-### 7. Почему pagination плохо сочетается с `join fetch` коллекции?
+### 8. Почему pagination плохо сочетается с `join fetch` коллекции?
 
-JOIN дублирует строку родителя по числу детей. LIMIT/OFFSET режет уже «размноженный»
-результат → неверная страница, недобор родителей, дубли. Обход: сначала выбрать id
-страницы без fetch коллекции, затем загрузить граф по id; либо иные стратегии (window,
-blaze-persistence и т.п.). Count-query для total отдельно.
+JOIN размножает строки родителя по числу элементов коллекции. `LIMIT`/`OFFSET`
+(и `Pageable`) режут этот результат, а не «N родителей» → недобор корней, обрезанные
+коллекции, неверный total при count по тому же join. `distinct` в JPQL проблему LIMIT
+сам по себе не чинит. Обход: страница id без collection fetch → `JOIN FETCH` /
+второй запрос по `IN (:ids)`; count отдельно без fetch. To-one fetch с пагинацией
+обычно ок; ломает именно to-many. Защита Hibernate:
+`fail_on_pagination_over_collection_fetch`.
 
-### 8. Что делает FlushMode.AUTO перед JPQL?
+Демо: [PaginationJoinFetchDemo.java](code/PaginationJoinFetchDemo.java).
+
+### 9. Что делает FlushMode.AUTO перед JPQL?
 
 Если в PC есть незаписанные изменения, которые могут повлиять на результат query,
 Hibernate при AUTO синхронизирует SQL (flush), затем выполняет SELECT. Иначе count/filter
 видел бы устаревшую БД относительно unit of work. Для массовых вставок flush душат
 осознанно (COMMIT/MANUAL + свой контроль), понимая риск рассинхрона query и PC.
 
-### 9. Почему `IDENTITY` мешает batch insert, а `SEQUENCE` — нет?
+### 10. Почему `IDENTITY` мешает batch insert, а `SEQUENCE` — нет?
 
 `IDENTITY` требует выполнить INSERT, чтобы узнать ключ; драйвер/провайдер часто не могут
 отправить пачку вставок и сразу получить все id. `SEQUENCE` (или optimized generators)
 позволяет заранее выделить диапазон id (`allocationSize`) и батчить INSERT.
 Цена: DDL sequence и `allocationSize` должны совпадать; иначе коллизии/дыры.
 
-### 10. Как работает `@Version` на уровне SQL?
+### 11. Как работает `@Version` на уровне SQL?
 
 UPDATE включает предикат `WHERE id = ? AND version = ?` и инкремент version в SET.
 Если строку уже изменила другая TX, updated row count = 0 → optimistic lock failure.
 Это не SERIALIZABLE и не защита любых аномалий: только конфликт на конкретной строке
 при устаревшей версии. Клиент ретраит с перечитыванием и повторной бизнес-проверкой.
 
-### 11. Чем опасен `equals`/`hashCode` по generated id?
+### 12. Чем опасен `equals`/`hashCode` по generated id?
 
 До присвоения id все объекты часто имеют один `hashCode`; после `persist`/flush id
 меняется → объект оказывается не в том bucket `HashSet`, `contains` возвращает false
@@ -574,28 +756,32 @@ UPDATE включает предикат `WHERE id = ? AND version = ?` и ин�
 завязанная на hash-структуры. Предпочтительнее стабильный business key или жёсткая
 дисциплина «не класть в Set до стабильного id».
 
-### 12. Когда имеет смысл L2 cache?
+### 13. Чем L1 отличается от L2? Когда включать L2?
 
-Read-mostly данные с низкой частотой инвалидации (справочники, конфиг), измеримый hit-rate,
-понятная стратегия согласованности (и TTL/eviction). На горячих write-агрегатах L2 даёт
-stale reads и overhead. Query cache без entity L2 обычно бессмысленен: кэшируются id,
-а сами entity всё равно грузятся. Включать «глобально» без метрик — ошибка.
+L1 (persistence context) — всегда, per Session: Java instances, identity map, dirty
+checking; два `find` одного id в одной TX → один instance без второго SELECT. L2 —
+опциональный shared cache **состояния** entity по id между Session; hit → hydrate в
+текущий L1. Имеет смысл на read-mostly справочниках с метриками hit-rate; на горячих
+write-агрегатах — stale и дорогая инвалидация. Query cache хранит id результатов и без
+L2 обычно бесполезен. Включать L2 «на всё приложение» без профиля — ошибка.
 
-### 13. Что не так с длинным `@Transactional` вокруг внешнего HTTP-вызова?
+Демо: [FirstSecondLevelCacheDemo.java](code/FirstSecondLevelCacheDemo.java).
+
+### 14. Что не так с длинным `@Transactional` вокруг внешнего HTTP-вызова?
 
 На время вызова удерживается connection из pool (и часто PC). Растёт latency TX,
 риск pool exhaustion, сложнее retry/идемпотентность, выше шанс deadlock/timeouts.
 Паттерн: короткая TX на локальные инварианты → внешний вызов → отдельная TX на
 подтверждение; либо transactional outbox / inbox.
 
-### 14. Когда сознательно уходить с JPA на `JdbcTemplate`/native?
+### 15. Когда сознательно уходить с JPA на `JdbcTemplate`/native?
 
 Когда важны точный SQL, throughput и предсказуемый план: reporting с CTE/window,
 массовые UPDATE/INSERT, ETL, «тонкие» read-модели без графа entity. Unit of work и
 dirty checking на миллионах строк раздувают память и генерируют лишний SQL. Нормальная
 архитектура — гибрид: JPA на агрегатах OLTP, JDBC/JOOQ на bulk и сложных выборках.
 
-### 15. Чем `getReference` отличается от `find`?
+### 16. Чем `getReference` отличается от `find`?
 
 `find` сразу загружает состояние (или возвращает null). `getReference` отдаёт proxy
 с известным id без SELECT до обращения к полям/ленивым ассоциациям (если id невалиден,

@@ -4,8 +4,9 @@ Java 17+. Заметка для изучения и подготовки к со
 
 Темы JVM (ClassLoader lifecycle, GC, runtime data areas) — в
 [`jvm/jvm.md`](../jvm/jvm.md). Дизайн abstract/interface, LSP, binding —
-в [`oop/oop.md`](../oop/oop.md). Здесь — язык и стандартная библиотека на уровне
-контрактов JLS / java.base.
+в [`oop/oop.md`](../oop/oop.md). Коллекции и `ConcurrentHashMap` — в
+[`collections/collections.md`](../collections/collections.md). Здесь — язык и
+стандартная библиотека на уровне контрактов JLS / java.base.
 
 ## Содержание
 
@@ -256,7 +257,71 @@ items.add("a");                     // ok: ссылка та же
 // items = List.of();               // нельзя: переприсвоить final-ссылку
 ```
 
-`final` на ссылке ≠ immutability объекта.
+`final` на ссылке ≠ immutability объекта. Как сделать по-настоящему immutable — ниже.
+
+### Immutable-класс
+
+Объект, у которого после создания нельзя изменить **наблюдаемое** состояние. «Правка» →
+новый экземпляр (как у `String`, хорошего `Money`).
+
+Чеклист классического класса:
+
+1. `final` class (или закрытая `sealed`-иерархия) — наследник не добавит сеттеры.
+2. Все поля `private final`, без сеттеров.
+3. Инициализация только в конструкторе / factory + проверки инвариантов.
+4. На входе — копия мутабельного (`List.copyOf`, copy массива), не сохранять чужой list.
+5. На выходе — не отдавать внутренний mutable (`items` уже unmodifiable после `copyOf`).
+6. Методы «изменения» возвращают **новый** объект.
+
+```java
+public final class Money {
+    private final BigDecimal amount;
+    private final Currency currency;
+
+    public Money(BigDecimal amount, Currency currency) {
+        this.amount = Objects.requireNonNull(amount);
+        this.currency = Objects.requireNonNull(currency);
+    }
+
+    public Money plus(Money other) {
+        if (!currency.equals(other.currency)) {
+            throw new IllegalArgumentException("currency mismatch");
+        }
+        return new Money(amount.add(other.amount), currency);
+    }
+}
+
+public final class Order {
+    private final List<String> items;
+
+    public Order(List<String> items) {
+        this.items = List.copyOf(items); // copy + unmodifiable; null-элемент → NPE
+    }
+
+    public List<String> items() {
+        return items;
+    }
+}
+```
+
+Современный путь — `record` (Java 16+): final class, private final компоненты,
+equals/hashCode/toString. Для мутабельных компонентов нужна защита в compact constructor
+(`List.copyOf` и т.п.) — иначе только *shallow* immutability.
+
+```java
+public record Money(BigDecimal amount, Currency currency) {
+    public Money {
+        Objects.requireNonNull(amount);
+        Objects.requireNonNull(currency);
+    }
+}
+```
+
+Типичные дыры: сеттер; `getList()` отдаёт внутренний `ArrayList`; конструктор сохранил
+переданный list; открытое наследование; поле `Date`/массив без копии. Настоящий immutable
+можно шарить между потоками без синхронизации (при safe publication).
+
+Демо: [ImmutableClassDemo.java](code/ImmutableClassDemo.java).
 
 ### `static`
 
@@ -1251,6 +1316,7 @@ Inference (Java 8+ targets / poly expressions) обычно «просто ра�
 | [ExceptionFinallyTwrsDemo.java](code/ExceptionFinallyTwrsDemo.java) | finally+return, multi-catch order, suppressed |
 | [SwitchOnStringDemo.java](code/SwitchOnStringDemo.java) | case-sensitive, `switch(null)`, expression |
 | [GenericsPecsErasureDemo.java](code/GenericsPecsErasureDemo.java) | invariance, PECS, erasure, heap pollution, capture helper |
+| [ImmutableClassDemo.java](code/ImmutableClassDemo.java) | final class / record / List.copyOf; final ≠ immutable |
 
 ---
 
@@ -1409,3 +1475,13 @@ cast’ы. Если подкласс уточняет параметр (`Node<In
 сигнатура не совпала бы с `setData(Object)` предка — компилятор генерирует synthetic
 bridge `setData(Object)`, который кастует и делегирует. Так сохраняется override при
 полиморфном вызове.
+
+### 18. Как создать immutable-класс? Достаточно ли `final` на полях?
+
+Нет: `final` на ссылке запрещает переприсвоение, но не мутацию объекта (`ArrayList`).
+Нужны: `final` class, `private final` поля без сеттеров, копии мутабельных входов/выходов,
+«изменения» через новые экземпляры. `record` упрощает шаблон, но для `List`/массива всё
+равно нужен `List.copyOf` (и т.п.) в compact constructor. Иначе клиент меняет «immutable»
+через общий mutable-объект.
+
+Демо: [ImmutableClassDemo.java](code/ImmutableClassDemo.java).

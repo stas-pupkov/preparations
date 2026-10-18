@@ -354,14 +354,83 @@ Random.ints()…                     // из java.util.Random / ThreadLocalRando
 |-------|------|
 | `forEach` / `forEachOrdered` | потребление; parallel: порядок у `forEach` не гарантирован |
 | `collect` | свертка в структуру через `Collector` |
-| `reduce` | свёртка к одному значению |
+| `reduce` | свёртка к одному значению (см. [§8.4](#84-reduce)) |
 | `count` / `min` / `max` | агрегаты |
 | `anyMatch` / `allMatch` / `noneMatch` | short-circuit предикаты |
 | `findFirst` / `findAny` | поиск; в parallel `findAny` обычно дешевле |
 | `toArray` | массив |
 | у `IntStream`: `sum`, `average`, `summaryStatistics` | числовые агрегаты |
 
-### 8.4. `collect` и `Collectors`
+### 8.4. `reduce`
+
+Свёртка потока в одно значение: на каждом шаге берётся накопленное и следующий элемент.
+
+Аналогия: стопка значений; правило «как смешать два» применяется, пока не останется одно.
+
+#### Три перегрузки
+
+**1. С нейтральным элементом (identity)** — тип результата = тип элемента:
+
+```java
+int sum = stream.reduce(0, (acc, x) -> acc + x);
+// или: stream.reduce(0, Integer::sum);
+```
+
+- identity — старт и ответ для пустого стрима (`0` для суммы, `1` для произведения…);
+- accumulator `(acc, x) → новый acc` — как смешать накопление и элемент.
+
+Пустой стрим → вернёт identity.
+
+**2. Без identity → `Optional`:**
+
+```java
+Optional<Integer> sum = stream.reduce(Integer::sum);
+```
+
+Пустой стрим → `Optional.empty()`. Непустой: первый элемент — старт, дальше accumulator.
+
+**3. Три аргумента** — результат другого типа и/или parallel:
+
+```java
+U result = stream.reduce(
+        identity,     // стартовое U
+        accumulator,  // (U, T) → U  — элемент в накопление
+        combiner      // (U, U) → U  — склеить два накопления (parallel)
+);
+```
+
+В последовательном стриме combiner почти не участвует; в параллельном без него нельзя
+корректно склеить частичные результаты разных потоков.
+
+#### Пошагово
+
+`[1, 2, 3, 4]`, `reduce(0, Integer::sum)`:
+
+```
+acc = 0
+acc = 0+1 → 1
+acc = 1+2 → 3
+acc = 3+3 → 6
+acc = 6+4 → 10
+```
+
+В parallel стрим режут на куски, каждый сворачивают, затем combiner склеивает куски.
+Операция должна быть **ассоциативной**: `(a ⊕ b) ⊕ c = a ⊕ (b ⊕ c)`. Сумма / max — ок;
+вычитание и «хрупкая» конкатенация — нет (sequential и parallel могут разойтись).
+
+#### `reduce` vs `collect`
+
+| | `reduce` | `collect` |
+|--|----------|-----------|
+| Цель | одно значение (число, `Optional`, редко буфер) | структура: `List`, `Map`, grouping… |
+| Стиль | обычно новый результат на шаг | supplier + мутабельный накопитель + combiner |
+| Практика | простые агрегаты; часто лучше `IntStream.sum()` / `max()` | `Collectors.*` |
+
+Многие `collect` — та же идея свёртки, заточенная под контейнеры.
+
+Демо: [ReduceDemo.java](code/ReduceDemo.java).
+
+### 8.5. `collect` и `Collectors`
 
 `collect` принимает `Collector` с supplier / accumulator / combiner / finisher.
 Готовые фабрики:
@@ -381,7 +450,7 @@ Collector<String, ?, List<String>> toList = Collector.of(
 );
 ```
 
-### 8.5. Stream vs Collection
+### 8.6. Stream vs Collection
 
 | | Collection | Stream |
 |--|------------|--------|
@@ -558,6 +627,7 @@ byte[] raw = Base64.getDecoder().decode(b64);
 | [DefaultMethodConflictDemo.java](code/DefaultMethodConflictDemo.java) | конфликт default и `A.super.m()` |
 | [OptionalPitfallsDemo.java](code/OptionalPitfallsDemo.java) | of/ofNullable, orElse vs orElseGet, анти-`get` |
 | [StreamPipelineDemo.java](code/StreamPipelineDemo.java) | лень, flatMap, collect/groupingBy, reuse |
+| [ReduceDemo.java](code/ReduceDemo.java) | три формы reduce, identity/Optional, associative vs parallel |
 | [ParallelStreamOrderingDemo.java](code/ParallelStreamOrderingDemo.java) | forEach vs forEachOrdered, last parallel/sequential wins |
 | [MapApiJava8Demo.java](code/MapApiJava8Demo.java) | computeIfAbsent, merge, compute → remove |
 | [DateTimeApiDemo.java](code/DateTimeApiDemo.java) | Instant/Local/Zoned, adjusters |
@@ -665,3 +735,29 @@ terminal». `parallel()` / `sequential()` переключают режим вс
 `orElse(value)` всегда вычисляет аргумент (дорогое создание default — зря).
 `orElseGet(supplier)` вызывает supplier только при пустом `Optional`. Для констант —
 без разницы; для `loadFromDb()` — только `orElseGet` / `orElseThrow`.
+
+### 15. Чем отличаются три перегрузки `Stream.reduce`?
+
+1. `reduce(identity, accumulator)` — всегда возвращает значение; пустой стрим → identity.
+2. `reduce(accumulator)` — `Optional`; пустой стрим → empty; старт — первый элемент.
+3. `reduce(identity, accumulator, combiner)` — тип результата может отличаться от элемента;
+   combiner склеивает частичные `U` в parallel.
+
+Демо: [ReduceDemo.java](code/ReduceDemo.java).
+
+### 16. Зачем combiner в `reduce`, если в sequential его «не видно»?
+
+В одном потоке достаточно accumulator: элементы идут слева направо. В parallel стрим
+делят на сегменты; каждый сегмент даёт своё накопление типа `U`, и combiner обязан
+ассоциативно склеить эти `U`. Без корректного combiner (или при неассоциативном
+операторе вроде вычитания) parallel даёт неверный или нестабильный относительно
+sequential результат. Для суммы часто пишут одну `Integer::sum` и в accumulator, и в
+combiner.
+
+### 17. Когда выбрать `reduce`, а когда `collect` / `IntStream.sum`?
+
+Простой числовой агрегат — `mapToInt(...).sum()` / `max()` / `summaryStatistics()`:
+читаемее и без boxing. `reduce` — когда нужна своя бинарная операция или свёртка к
+нестандартному скаляру. Сборка `List`/`Map`/grouping — `collect` (мутабельный контейнер +
+готовые `Collectors`). `collect` тоже свёртка, но контракт заточен под структуры, а не
+под «одно значение».
