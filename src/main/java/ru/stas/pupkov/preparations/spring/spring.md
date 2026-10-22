@@ -21,8 +21,17 @@ TX / N+1 — [jpa-hibernate.md](../databases/jpa-hibernate.md) (Spring Data JPA 
 11. [Spring Security](#11-spring-security)
 12. [Web MVC: краткий каркас](#12-web-mvc-краткий-каркас)
 13. [Профили и условия](#13-профили-и-условия)
-14. [Демо-код](#14-демо-код)
-15. [Вопросы для собеседования и ответы](#15-вопросы-для-собеседования-и-ответы)
+14. [REST и SOAP](#14-rest-и-soap)
+15. [HTTP cookie](#15-http-cookie)
+16. [События в Spring](#16-события-в-spring)
+17. [Spring Cloud Config](#17-spring-cloud-config)
+18. [OpenFeign](#18-openfeign)
+19. [WebSockets](#19-websockets)
+20. [Spring Integration](#20-spring-integration)
+21. [Spring Data REST](#21-spring-data-rest)
+22. [Actuator в Docker / K8s](#22-actuator-в-docker--k8s)
+23. [Демо-код](#23-демо-код)
+24. [Вопросы для собеседования и ответы](#24-вопросы-для-собеседования-и-ответы)
 
 ---
 
@@ -1238,7 +1247,17 @@ static class UserService {
 
 Абстракция одна — смена бэкенда через другой `CacheManager`.
 
-### 9.5. Ловушки
+Подробнее про Redis, блокировки и выбор кэша — [redis.md](../redis/redis.md).
+
+### 9.5. Как выбрать провайдер (кратко)
+
+1. Один инстанс, справочники, микросекундная latency → **Caffeine** (локально).
+2. Несколько нод, нужна общая картина и инвалидация → **Redis** (или Hazelcast).
+3. Деньги / строгие инварианты → не кэшируй write-path без продуманного TTL и
+   инвалидации; source of truth — БД.
+4. Часто делают L1 (Caffeine) + L2 (Redis).
+
+### 9.6. Ловушки
 
 Self-invocation — как у транзакций. Код из
 [CacheAbstractionDemo.java](code/CacheAbstractionDemo.java):
@@ -1625,7 +1644,230 @@ Security filters → DispatcherServlet → Controller
 
 ---
 
-## 14. Демо-код
+## 14. REST и SOAP
+
+| | REST (часто HTTP + JSON) | SOAP |
+|--|--------------------------|------|
+| Стиль | ресурсы и глаголы HTTP | RPC-операции в XML-конверте |
+| Контракт | OpenAPI / договорённости | WSDL + XSD |
+| Где встречается | публичные API, микросервисы | legacy / enterprise-интеграции |
+
+Пример REST:
+
+```http
+POST /orders
+Content-Type: application/json
+
+{"userId": 1, "items": […]}
+```
+
+```http
+GET /orders/42
+→ 200 {"id":42,"status":"PAID"}
+```
+
+SOAP — XML-сообщение с `Envelope` / `Body` и операцией вроде `PlaceOrder`. Строже
+контракт и tooling, тяжелее читать и дебажить.
+
+«RESTful» на собесе: осмысленные ресурсы, правильные методы и коды, идемпотентность
+`GET`/`PUT`/`DELETE`. HATEOAS на практике встречается редко.
+
+---
+
+## 15. HTTP cookie
+
+**Cookie** — маленький кусок данных, который сервер просит браузер хранить и присылать
+назад.
+
+```http
+Set-Cookie: SESSION=abc; Path=/; HttpOnly; Secure; SameSite=Lax
+```
+
+Браузер потом сам добавит:
+
+```http
+Cookie: SESSION=abc
+```
+
+Важные флаги:
+
+| Флаг | Зачем |
+|------|--------|
+| `HttpOnly` | JS не читает cookie → сложнее украсть через XSS |
+| `Secure` | только HTTPS |
+| `SameSite` | ограничить отправку с чужих сайтов (CSRF) |
+| `Path` / `Domain` | куда cookie относится |
+
+Два мира сессий:
+
+- **cookie-session** — сервер знает сессию, браузер шлёт cookie → нужен CSRF-token;
+- **Bearer JWT** — клиент кладёт токен в заголовок сам → CSRF обычно не про cookie.
+
+Антипаттерн: выключить CSRF и оставить form-login на cookie «потому что у нас JSON API».
+
+---
+
+## 16. События в Spring
+
+Внутри одного приложения:
+
+```java
+@Service
+class OrderService {
+    private final ApplicationEventPublisher events;
+
+    @Transactional
+    public void pay(long orderId) {
+        // … меняем БД …
+        events.publishEvent(new OrderPaidEvent(orderId));
+    }
+}
+
+@Component
+class MailListener {
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    void onPaid(OrderPaidEvent e) {
+        mail.send(e.orderId());
+    }
+}
+```
+
+`AFTER_COMMIT` — письмо только если транзакция реально зафиксировалась.
+
+События **между сервисами** (Kafka и саги) — в
+[microservices.md](../microservices/microservices.md).
+
+---
+
+## 17. Spring Cloud Config
+
+**Config Server** — общее хранилище настроек (часто Git). Сервисы при старте забирают
+`application.yml` для своего имени и профиля.
+
+```text
+Git repo
+  application.yml
+  order-service-prod.yml
+        ↓
+  Config Server
+        ↓
+  order-service (client)
+```
+
+В Boot 2.4+ типично:
+
+```properties
+spring.config.import=optional:configserver:http://config:8888
+spring.application.name=order-service
+```
+
+Плюсы: один источник правды, смена конфига без пересборки образа (с оговорками).
+Минусы: зависимость на старте, секреты в Git лучше не хранить открытым текстом
+(Vault / encrypted).
+
+Если уже Kubernetes ConfigMap/Secrets + GitOps — отдельный Config Server часто не нужен.
+
+---
+
+## 18. OpenFeign
+
+**OpenFeign** — декларативный HTTP-клиент: пишешь интерфейс, получаешь proxy.
+
+```java
+@FeignClient(name = "payment-service", url = "${payment.url}")
+public interface PaymentClient {
+    @PostMapping("/charges")
+    ChargeResponse charge(@RequestBody ChargeRequest request);
+}
+```
+
+Вызов `paymentClient.charge(...)` → HTTP POST.
+
+Рядом со Spring Cloud: load balancer, timeouts, circuit breaker (Resilience4j).
+
+На что смотрят:
+
+- таймауты и ретраи только на идемпотентные методы;
+- понятный error decoder;
+- Feign — синхронный RPI, не замена очереди.
+
+Альтернативы: `RestClient` / `WebClient`, Spring Interface Clients.
+
+---
+
+## 19. WebSockets
+
+Обычный HTTP: спросил — ответил — соединение закрыли (упрощённо).
+**WebSocket** — соединение живёт, данные идут в обе стороны, когда нужно.
+
+```text
+Клиент ←→ сервер: «цена акции изменилась» без постоянного polling
+```
+
+В Spring: raw WebSocket или STOMP (часто + SockJS для fallback).
+
+Когда брать: чаты, котировки, live-доски. Когда нет: редкие запросы — хватит REST или SSE.
+
+На нескольких нодах: sticky session или общий Redis pub/sub, иначе сообщение попало
+на ноду A, а сокет висит на ноде B.
+
+---
+
+## 20. Spring Integration
+
+Фреймворк для **интеграционных потоков** (EIP): Message, Channel, Transformer, Router,
+Gateway, адаптеры к Kafka/JMS/файлам/HTTP/mail.
+
+```text
+файл → channel → transform JSON → router → Kafka / БД
+```
+
+Бери, когда в одном приложении много протоколов и маршрутов сообщений.
+Для «просто слушать Kafka» чаще хватает Spring Kafka. Не путать со
+**Spring Cloud Stream** (абстракция binder'ов).
+
+---
+
+## 21. Spring Data REST
+
+Экспортирует Spring Data-репозиторий как HTTP API почти без контроллера.
+
+```java
+@RepositoryRestResource
+public interface UserRepository extends JpaRepository<User, Long> { }
+```
+
+→ `GET /users`, `POST /users`, … (HAL).
+
+Удобно для прототипа. На проде часто рано упираются в: утечка модели БД наружу,
+тонкий контроль над DTO/security/валидацией. Тогда — явные `@RestController`.
+
+---
+
+## 22. Actuator в Docker / K8s
+
+**Actuator** — технические endpoint'ы: health, metrics, info, иногда env/heapdump.
+
+В контейнере / Kubernetes:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+readinessProbe:
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
+```
+
+Имеет смысл разделять:
+
+- **liveness** — процесс жив (не зависит от падения БД навсегда);
+- **readiness** — можно слать трафик (БД/брокер доступны).
+
+Безопасность: не открывай `/actuator/env` и dump'ы в интернет. Отдельный management
+port или жёсткие правила в Spring Security.
+
+---
+
+## 23. Демо-код
 
 | Файл | Что разбирает |
 |------|----------------|
@@ -1646,7 +1888,7 @@ Security filters → DispatcherServlet → Controller
 
 ---
 
-## 15. Вопросы для собеседования и ответы
+## 24. Вопросы для собеседования и ответы
 
 ### 1. Чем `BeanFactory` отличается от `ApplicationContext`?
 
@@ -1862,3 +2104,26 @@ Tx вызывающего **не join’ится** (другой поток, Thr
 хрупко из‑за порядка advice. `this.@Transactional` внутри `@Async` — не сработает (proxy).
 Для работы строго после commit outer — `afterCommit` / outbox, не голый `@Async` из tx.
 Демо: [AsyncTransactionalDemo.java](code/AsyncTransactionalDemo.java).
+
+### 32. Зачем Spring Cloud Config, если есть env-переменные?
+
+Централизованные профильные настройки для многих сервисов (часто из Git) и иногда refresh
+без пересборки. Env/K8s Secrets хорошо закрывают секреты и простые значения; Config Server —
+когда много общих yaml и единый источник. См. [§17](#17-spring-cloud-config).
+
+### 33. Чем Feign отличается от RestClient?
+
+Feign — декларативный интерфейс → HTTP. RestClient/WebClient — императивный вызов.
+Идея одна (синхронный/реактивный RPI); Feign удобен как «клиент = API-контракт».
+
+### 34. Cookie-session или JWT?
+
+Cookie-session: сервер хранит сессию, удобный logout, нужен CSRF. JWT Bearer: клиент
+носит token, проще горизонтально масштабировать resource server, сложнее мгновенная
+инвалидация. См. [§15](#15-http-cookie).
+
+### 35. Liveness и readiness в Actuator — в чём разница?
+
+Liveness: «процесс пора перезапустить». Readiness: «пока не готовы принимать трафик».
+Готовый health с падением БД на liveness может устроить рестарт-луп — часто БД только в
+readiness. См. [§22](#22-actuator-в-docker--k8s).

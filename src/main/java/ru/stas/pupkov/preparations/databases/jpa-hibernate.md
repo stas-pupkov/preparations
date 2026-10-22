@@ -147,6 +147,53 @@ class Product {
 JPQL оперирует **именами entity и полей**, не таблиц (пока не native query).
 Criteria API — programmatic-построение; удобен для динамических фильтров, verbose.
 
+### 3.1. `@Embeddable` и `@Embedded`
+
+Простыми словами: **кусок полей без своей таблицы и без своего id**.
+
+Адрес сам по себе не «строка в БД заказов» — он лежит **в колонках таблицы заказа**.
+
+```java
+@Embeddable
+public class Address {
+    private String city;
+    private String street;
+}
+
+@Entity
+public class Order {
+    @Id
+    private Long id;
+
+    @Embedded
+    private Address deliveryAddress;
+}
+```
+
+Таблица `orders` получит колонки вроде `city`, `street` (имена можно переопределить).
+
+| | `@Entity` | `@Embeddable` |
+|--|-----------|---------------|
+| Своя таблица | да | нет (колонки у владельца) |
+| Свой `@Id` | да | нет |
+| Lifecycle | сам / через связи | живёт и умирает с родителем |
+
+Два одинаковых embed в одной entity — через `@AttributeOverride`:
+
+```java
+@Embedded
+@AttributeOverrides({
+    @AttributeOverride(name = "city", column = @Column(name = "bill_city")),
+    @AttributeOverride(name = "street", column = @Column(name = "bill_street"))
+})
+private Address billing;
+```
+
+`@ElementCollection` списка адресов → уже **отдельная** таблица коллекций, не «всё в
+orders».
+
+Демо: [EmbeddableMappingDemo.java](code/EmbeddableMappingDemo.java).
+
 ---
 
 ## 4. Persistence context и lifecycle
@@ -652,6 +699,7 @@ Spring Data **JDBC** — отдельная модель (без lazy PC JPA); �
 | [PaginationJoinFetchDemo.java](code/PaginationJoinFetchDemo.java) | LIMIT по JOIN ≠ страница родителей; паттерн id→fetch |
 | [EntityEqualsHashCodePitfallDemo.java](code/EntityEqualsHashCodePitfallDemo.java) | HashSet + generated id |
 | [OptimisticLockVersionDemo.java](code/OptimisticLockVersionDemo.java) | `UPDATE … WHERE version`; конфликт TX |
+| [EmbeddableMappingDemo.java](code/EmbeddableMappingDemo.java) | `@Embeddable` в колонках родителя; не отдельная таблица |
 | [FirstSecondLevelCacheDemo.java](code/FirstSecondLevelCacheDemo.java) | L1 hit vs L2 hit vs DB; разные Session |
 
 Демо моделируют семантику в JVM без реального драйвера/Hibernate Session — для контрактов.
@@ -787,3 +835,9 @@ dirty checking на миллионах строк раздувают памят�
 с известным id без SELECT до обращения к полям/ленивым ассоциациям (если id невалиден,
 ошибка всплывёт позже). Удобно выставлять `@ManyToOne` по id без лишнего SELECT;
 опасно, если дальше сериализуют proxy или предполагают, что сущность точно существует.
+
+### 17. Что такое `@Embeddable`?
+
+Value object без своей таблицы и `@Id`: поля лежат в колонках entity-владельца
+(`@Embedded`). Lifecycle = родитель. Не путать с `@Entity` / `@OneToOne`. Демо:
+[EmbeddableMappingDemo.java](code/EmbeddableMappingDemo.java). См. [§3.1](#31-embeddable-и-embedded).

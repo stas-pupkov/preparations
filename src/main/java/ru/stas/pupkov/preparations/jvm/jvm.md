@@ -12,8 +12,9 @@ Java 17+. Заметка для изучения и подготовки к со
 6. [Frames](#6-frames)
 7. [Execution Engine](#7-execution-engine)
 8. [Garbage Collection](#8-garbage-collection)
-9. [Демо-код](#9-демо-код)
-10. [Вопросы для собеседования и ответы](#10-вопросы-для-собеседования-и-ответы)
+9. [Сила ссылок: Strong, Soft, Weak, Phantom](#9-сила-ссылок-strong-soft-weak-phantom)
+10. [Демо-код](#10-демо-код)
+11. [Вопросы для собеседования и ответы](#11-вопросы-для-собеседования-и-ответы)
 
 ---
 
@@ -462,7 +463,38 @@ JNI-ссылки и т.п.
 
 ---
 
-## 9. Демо-код
+## 9. Сила ссылок: Strong, Soft, Weak, Phantom
+
+Обычная переменная в Java — **сильная ссылка (strong reference)**. Пока на объект есть
+хотя бы одна strong-ссылка из живого графа — GC его не заберёт.
+
+Иногда нужно «держать, но не мешать GC». Для этого есть обёртки в `java.lang.ref`.
+
+| Тип | Поведение простыми словами | Типичный кейс |
+|-----|----------------------------|---------------|
+| Strong | обычная ссылка | почти весь код |
+| SoftReference | живёт дольше при нехватке памяти может очиститься | кэш, который жалко, но можно пересчитать |
+| **WeakReference** | если strong больше нет — можно собрать на следующей GC | `WeakHashMap`, каноникализация |
+| PhantomReference | после финализации, для аккуратной очистки native-ресурсов | редко, вместо `finalize` |
+
+```java
+Object data = new byte[1024];
+WeakReference<Object> weak = new WeakReference<>(data);
+
+data = null;          // сильных ссылок не осталось
+System.gc();          // намёк GC (не гарантия!)
+Object again = weak.get(); // часто null после сборки
+```
+
+`WeakHashMap`: **ключи** weak. Запись может исчезнуть, когда на ключ больше никто не
+ссылается сильно. Значения при этом обычные — если значение тянет ключ, запись
+«залипнет» (common pitfall).
+
+Демо: [WeakReferenceDemo.java](code/WeakReferenceDemo.java).
+
+---
+
+## 10. Демо-код
 
 | Файл | Что разбирает |
 |------|----------------|
@@ -470,10 +502,11 @@ JNI-ссылки и т.п.
 | [ClassInitializationDemo.java](code/ClassInitializationDemo.java) | preparation vs `<clinit>`, `forName(..., false, ...)` |
 | [RuntimeDataAreasDemo.java](code/RuntimeDataAreasDemo.java) | heap / Metaspace / Code Cache через MXBean |
 | [StackOverflowDemo.java](code/StackOverflowDemo.java) | стек потока и `StackOverflowError` |
+| [WeakReferenceDemo.java](code/WeakReferenceDemo.java) | strong vs weak; запись в WeakHashMap |
 
 ---
 
-## 10. Вопросы для собеседования и ответы
+## 11. Вопросы для собеседования и ответы
 
 ### 1. Чем JVM отличается от JRE/JDK и от HotSpot?
 
@@ -565,3 +598,9 @@ Delegation защищает платформенные классы и дела�
 из Bootstrap. Child-first используют в плагинах, когда нужна своя версия библиотеки, уже
 есть у parent. Тогда общие API-типы надо заранее вынести в shared / parent loader, иначе
 появятся «два одинаковых класса» и странные `ClassCastException`.
+
+### 14. Чем WeakReference отличается от обычной ссылки?
+
+Обычная (strong) держит объект живым. `WeakReference` позволяет GC собрать объект, если
+сильных ссылок больше нет — `get()` вернёт `null`. Используют в кэшах/`WeakHashMap`,
+чтобы не удерживать память искусственно. См. [§9](#9-сила-ссылок-strong-soft-weak-phantom).

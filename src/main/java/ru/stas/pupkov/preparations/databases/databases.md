@@ -17,8 +17,9 @@ Java 17+. Заметка для изучения и подготовки к со
 8. [Транзакции и ACID](#8-транзакции-и-acid)
 9. [Аномалии параллельного доступа](#9-аномалии-параллельного-доступа)
 10. [Уровни изоляции](#10-уровни-изоляции)
-11. [Демо-код](#11-демо-код)
-12. [Вопросы для собеседования и ответы](#12-вопросы-для-собеседования-и-ответы)
+11. [`FOR UPDATE SKIP LOCKED`](#11-for-update-skip-locked)
+12. [Демо-код](#12-демо-код)
+13. [Вопросы для собеседования и ответы](#13-вопросы-для-собеседования-и-ответы)
 
 ---
 
@@ -940,7 +941,47 @@ SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 
 ---
 
-## 11. Демо-код
+## 11. `FOR UPDATE SKIP LOCKED`
+
+Обычный `SELECT … FOR UPDATE` **блокирует** найденные строки. Другая транзакция,
+которая хочет те же строки, **ждёт**.
+
+`SKIP LOCKED` говорит: «если строка уже кем-то залочена — **просто пропусти её**,
+не жди».
+
+```sql
+BEGIN;
+SELECT id, payload
+FROM job_queue
+WHERE status = 'NEW'
+ORDER BY id
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+
+-- обработали задачу
+UPDATE job_queue SET status = 'DONE' WHERE id = …;
+COMMIT;
+```
+
+Два воркера одновременно:
+
+```text
+Воркер A: взял job 1 (lock)
+Воркер B: не ждёт job 1 → сразу берёт job 2
+```
+
+Без `SKIP LOCKED` воркер B сидел бы в очереди на lock.
+
+Где используют: таблица-очередь задач, выдача «свободного» заказа курьеру, любые
+«дай следующую незанятую строку нескольким воркерам».
+
+Есть в PostgreSQL и MySQL 8+. Рядом по смыслу: `NOWAIT` (не ждать, а сразу ошибка).
+
+Демо модели: [SkipLockedDemo.java](code/SkipLockedDemo.java).
+
+---
+
+## 12. Демо-код
 
 | Файл | Что разбирает |
 |------|----------------|
@@ -954,13 +995,14 @@ SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 | [IsolationAnomaliesDemo.java](code/IsolationAnomaliesDemo.java) | dirty / non-repeatable / phantom / lost update |
 | [IsolationLevelsDemo.java](code/IsolationLevelsDemo.java) | какие аномалии отсекает каждый ANSI-уровень |
 | [IsolationLevelsDetailedDemo.java](code/IsolationLevelsDetailedDemo.java) | таймлайны SQL по каждому уровню + lost update / SSI |
+| [SkipLockedDemo.java](code/SkipLockedDemo.java) | очередь задач: wait vs SKIP LOCKED |
 
 Демо моделируют семантику в процессе JVM без СУБД — для закрепления контрактов.
 Поведение конкретной БД всегда сверять с документацией и `EXPLAIN`.
 
 ---
 
-## 12. Вопросы для собеседования и ответы
+## 13. Вопросы для собеседования и ответы
 
 ### 1. Чем candidate key отличается от primary key?
 
@@ -1109,3 +1151,10 @@ SSI обнаруживает опасные зависимости чтения/
 под реальные запросы + осознанная точечная денормализация. Индекс на плохой схеме
 не спасёт от update anomalies; идеальная 5NF без индексов под JOIN убьёт latency.
 Смотрят: инварианты → доступ (запросы) → физика (индексы, partitioning).
+
+### 20. Что делает `FOR UPDATE SKIP LOCKED`?
+
+Берёт строки с пессимистическим lock, но уже залоченные **не ждёт**, а пропускает.
+Удобно для конкурентной очереди задач в таблице: несколько воркеров не блокируют
+друг друга на одной строке. См. [§11](#11-for-update-skip-locked). Демо:
+[SkipLockedDemo.java](code/SkipLockedDemo.java).

@@ -724,6 +724,22 @@ Payload fromA = exchanger.exchange(mineB);
 
 ## 13. Lock, ReadWriteLock, Semaphore
 
+**`Lock`** (`java.util.concurrent.locks.Lock`) — явный замок: «перед критической секцией
+взял, после — отпустил». Тот же смысл, что у `synchronized`, но с более гибким API.
+
+Простая картинка:
+
+```text
+lock.lock();
+try {
+    // только один поток здесь
+} finally {
+    lock.unlock(); // обязательно, иначе замок «залипнет»
+}
+```
+
+Самая частая реализация — `ReentrantLock` (можно войти повторно тому же потоку).
+
 `synchronized` vs `ReentrantLock`:
 
 | | `synchronized` | `ReentrantLock` |
