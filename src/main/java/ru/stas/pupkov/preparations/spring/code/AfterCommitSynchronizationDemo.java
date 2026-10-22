@@ -27,7 +27,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * commit — для реальной работы с БД нужен {@code PROPAGATION_REQUIRES_NEW}.
  * <p>
  * Запуск (после compileJava), с runtime classpath Gradle.
- */}
+ */
 public final class AfterCommitSynchronizationDemo {
 
     public static void main(String[] args) {

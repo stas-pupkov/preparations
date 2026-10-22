@@ -34,3 +34,12 @@ dependencies {
 tasks.named('test') {
     useJUnitPlatform()
 }
+
+// ./gradlew runDemo -PmainClass=ru.stas.pupkov.preparations.designpatterns.code.StrategyDemo
+tasks.register('runDemo', JavaExec) {
+    group = 'application'
+    description = 'Run a demo main class (-PmainClass=...)'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = providers.gradleProperty('mainClass')
+            .orElse('ru.stas.pupkov.preparations.PreparationsApplication')
+}
