@@ -62,17 +62,37 @@ replay и интеграция в data platform. Брать очередь (Rabb
 | **Consumer group** | Набор consumer'ов с одним `group.id`; партиции делятся между членами группы |
 | **Controller / KRaft** | Управление метаданными кластера |
 
-### ZooKeeper и KRaft
-
-Исторически координация шла через ZooKeeper. С Kafka 2.8 появился режим без ZK
-(**KIP-500**), с **3.3+** KRaft (Kafka Raft Metadata Mode) стабилен и рекомендован для
-новых установок. Брокеры сами держат кворум метаданных на Raft; отдельный ZK-кластер
-больше не нужен.
-
 ### Record
 
 Запись в логе: optional `key`, `value`, headers, timestamp, `offset` (назначает брокер
 внутри партиции), `partition`.
+
+### Метаданные и маршрутизация клиента
+
+Центрального прокси в Kafka нет: **клиент сам** выбирает, к какому брокеру слать
+Produce/Fetch. Карта кластера (брокеры, топики, лидер каждой партиции) приходит через
+Metadata API. `bootstrap.servers` — только точки входа за первой картой; достаточно
+одного живого адреса из списка, дальше клиент ходит к лидерам напрямую и кэширует
+топологию в памяти.
+
+Кэш считается верным, пока нет сигнала об устаревании:
+
+| Триггер | Смысл |
+|---------|--------|
+| `NotLeaderForPartition` | Запрос ушёл не к текущему лидеру |
+| `UnknownTopicOrPartition` | Топик/партиция ещё не известны брокеру (свежий топик, неверный номер) |
+| Обрыв соединения | Брокер недоступен → метаданные с другого узла |
+| `metadata.max.age.ms` | Проактивный refresh без ошибки (иначе не увидеть, например, новые партиции) |
+
+Единичные всплески этих ошибок после рестарта брокера или смены числа партиций —
+ожидаемы. Постоянный поток — почти всегда сеть или неверные адреса в метаданных.
+
+**`listeners` vs `advertised.listeners`.** `listeners` — на каких интерфейсах брокер
+слушает. `advertised.listeners` — что он **сообщает клиентам** в MetadataResponse.
+В Docker/Kubernetes/NAT/облаке типичный инцидент: брокер отдаёт внутренний адрес
+(`kafka.internal:9092`), снаружи недоступный → клиент «потерял кластер», хотя брокеры
+живы. Симптом: бесконечные коннекты к хосту, которого клиент «узнал» из метаданных,
+а не из `bootstrap.servers`.
 
 ---
 
@@ -182,14 +202,33 @@ consumer). Это другой уровень, чем одна только ид
   порядком (клиент сам следит за контрактом);
 - `partitioner.class` — кастомная логика; без ключа в новых клиентах sticky batching.
 
+### Лимиты размера сообщения (каскад)
+
+Дефолтный потолок на брокере порядка ~1 MiB (`message.max.bytes`). Превышение →
+`RecordTooLargeException`. Крупные записи бьют по throughput, GC, репликации и
+восстановлению брокера — поэтому лимит выбран сознательно.
+
+Лимиты **каскадные** и должны быть согласованы на всём тракте:
+
+| Где | Параметр |
+|-----|----------|
+| Брокер | `message.max.bytes` |
+| Репликация | `replica.fetch.max.bytes` |
+| Producer | `max.request.size` |
+| Consumer | `fetch.max.bytes`, `max.partition.fetch.bytes` |
+
+Типичный прод-баг: producer поднял `max.request.size`, consumer оставил маленький
+`fetch.max.bytes` → запись есть, чтение встаёт. Поднимать размеры нужно синхронно
+на всех сторонах.
+
 ---
 
 ## 6. Consumer, consumer group, offset
 
 ### Модель чтения
 
-Kafka — **pull**: consumer сам запрашивает данные (`poll`), контролируя скорость.
-Это не push-брокер в духе классического AMQP.
+Kafka — **pull**: consumer сам запрашивает данные (`poll` → Fetch), контролируя скорость.
+Это не push-брокер в духе классического AMQP: брокер не «пушит» сообщения клиенту.
 
 Внутри одной **consumer group**:
 
@@ -203,6 +242,23 @@ Kafka — **pull**: consumer сам запрашивает данные (`poll`)
 партиций (queue-like на уровне partition assignment).
 
 Демо: [ConsumerGroupAssignmentDemo.java](code/ConsumerGroupAssignmentDemo.java).
+
+### Long polling и purgatory
+
+Пустой Fetch при отсутствии новых данных был бы дорог. Long polling: брокер
+**придерживает** ответ, пока не наберётся объём или не истечёт ожидание.
+
+- `fetch.min.bytes` — минимум данных в ответе;
+- `fetch.max.wait.ms` — максимум удержания на брокере.
+
+Отложенный Fetch живёт во внутренней очереди ожидания (**purgatory**): между
+«выполнен» и «отклонён», пока не сработает условие. Данных сразу достаточно —
+ответ без очереди. Trade-off: меньше пустых round-trip, но при низкой нагрузке
+и завышенном `fetch.min.bytes` события «запаздывают», пока брокер ждёт пачку.
+
+Лимиты одного Fetch: `fetch.max.bytes` (весь запрос) и `max.partition.fetch.bytes`
+(на партицию). Их нужно держать согласованными с лимитами записи
+([§5](#лимиты-размера-сообщения-каскад)).
 
 ### Offset
 
@@ -229,18 +285,43 @@ committed offset (следующая позиция).
 `commitAsync` — без ожидания, выше throughput, при ошибке сам не ретраит так же
 агрессивно; часто комбинируют: async в цикле + sync на rebalance/shutdown.
 
-### Group coordinator vs consumer group leader
+### Group coordinator, JoinGroup / SyncGroup, generation
 
 - **Group coordinator** — брокер, ведущий membership группы, heartbeat и хранение
-  offset'ов группы.
+  offset'ов группы. Клиент находит его через `FindCoordinator` по `group.id`.
 - В **classic rebalance protocol** один из consumer'ов становится **group leader** и
   считает assignment; это не «лидер, который раздаёт offset другим». Offset коммитят
   сами consumer'ы координатору.
 
-Heartbeat-поток (или эквивалент в новых протоколах) показывает координатору, что
-member жив. Если heartbeat пропал дольше `session.timeout.ms` — member выкидывают,
-идёт rebalance. Отдельно: если между `poll` слишком долго (`max.poll.interval.ms`) —
-member тоже считается застрявшим на обработке.
+Классический цикл (упрощённо):
+
+1. Members шлют `JoinGroup`; координатор ждёт всех активных и запускает rebalance.
+2. Один member — group leader — получает список членов и строит assignment
+   (стратегия `partition.assignment.strategy`).
+3. Все шлют `SyncGroup`; лидер вкладывает план, остальные — пусто.
+4. Координатор раздаёт каждому его партиции → группа Stable.
+
+Каждый успешный цикл поднимает **`generation.id`**. `OffsetCommit` несёт поколение:
+commit от устаревшего generation → `ILLEGAL_GENERATION`. Так member прошлого
+поколения не перезапишет offset после потери членства.
+
+Два параллельных контура: основной поток делает `poll`/обработку; фоновый —
+heartbeat координатору. Heartbeat ещё и обратный канал: в ответе может прийти
+сигнал вроде `REBALANCE_IN_PROGRESS` — пора переприсоединяться.
+
+- `session.timeout.ms` — жив ли member для координатора (пропали heartbeat).
+- `max.poll.interval.ms` — не застряла ли обработка (heartbeat идут, а `poll` давно
+  не вызывался). Это **разные** таймеры; путать их — частая ошибка на собесе и в проде.
+
+### Static membership (`group.instance.id`)
+
+По умолчанию member динамический: ушёл → сразу выкинули → вернулся как новый →
+rebalance. При частых рестартах (деплой, rolling restart) это даёт шторм.
+
+**Static membership** (KIP-345): стабильный `group.instance.id` на инстанс.
+Координатор при кратком исчезновении не рвёт группу сразу, а ждёт возвращения
+того же ID в пределах `session.timeout.ms`. Успел вернуться — те же партиции без
+полного rebalance. Типичный приём для stateful consumer'ов и частых рестартов подов.
 
 ---
 
@@ -465,7 +546,8 @@ transactions + read_committed (+ idempotent producer)
 
 Rebalance — перераспределение партиций между members группы. Триггеры: join/leave,
 падение member, подписка на новые топики, изменение числа партиций, истечение
-session / max.poll.interval.
+session / max.poll.interval. Протокол JoinGroup/SyncGroup и `generation.id` —
+в [§6](#group-coordinator-joingroup--syncgroup-generation).
 
 Протоколы:
 
@@ -475,7 +557,13 @@ session / max.poll.interval.
 
 Антипаттерн **rebalancing storm**: нестабильные инстансы, слишком агрессивные таймауты,
 долгая обработка при маленьком `max.poll.interval.ms`, частый деплой без graceful
-shutdown (`wakeup`/`close`).
+shutdown (`wakeup`/`close`). Смягчение рестартов: static membership
+([§6](#static-membership-groupinstanceid)).
+
+Типичный цикл шторма: обработка батча дольше `max.poll.interval.ms` → member сам
+покидает группу → другой берёт те же партиции → снова не укладывается → бесконечный
+rebalance. Лечение: ускорить process, уменьшить `max.poll.records`, поднять
+`max.poll.interval.ms` под реальное время батча.
 
 ---
 
@@ -487,8 +575,10 @@ shutdown (`wakeup`/`close`).
 | Consumer lag | обработка медленнее produce | партиции, concurrency, batch, узкое место в коде/БД |
 | Hot partition | перекос ключей | кардинальность ключа, custom partitioner |
 | Stuck partition | блокировка на одном сообщении | таймауты, poison pill / DLQ-паттерн снаружи, изоляция тяжёлой работы |
-| Rebalance storm | thrashing assignment | session/poll interval, стабильность подов, cooperative |
+| Rebalance storm | thrashing assignment | session/poll interval, static membership, cooperative |
 | Under-replicated | реплики отстают | диск/сеть, нагрузка, ISR |
+| «Кластер мёртв», брокеры живы | клиент ходит не туда | `advertised.listeners`, сеть, устаревшие метаданные |
+| Всё OK, но медленно | silent throttling по квоте | `produce/fetch-throttle-time-avg` |
 
 Lag Kafka **сама не «лечит»** — даёт метрики (consumer group lag, AdminClient). Решение —
 масштаб и оптимизация consumer path.
@@ -498,6 +588,18 @@ consumer'а. В классической модели конкурирующие
 партицию по сообщениям. В новых версиях Kafka развивается модель share groups / queues
 (KIP-932 и продолжения) — имеет смысл знать как тренд, на собесе уточнять версию
 кластера.
+
+### Квоты и throttling
+
+Брокер может ограничивать клиента по пропускной способности и доле CPU. При превышении
+квоты **ошибки часто нет**: в ответе приходит `ThrottleTimeMs`, клиентская библиотека
+искусственно замедляется. Снаружи — рост latency при нулевом error rate.
+
+Куда смотреть: клиентские метрики `produce-throttle-time-avg`, `fetch-throttle-time-avg`.
+Ненулевые значения = брокер намеренно тормозит. Особо опасно для async producer:
+буфер забивается → после исчерпания `buffer.memory` `send()` блокируется, приложение
+перестаёт принимать вход. При разборе «всё успешно, но тормозит» throttle-метрики —
+первый чеклист, не последний.
 
 ---
 
@@ -755,3 +857,32 @@ Kafka — журнал событий: большой поток, долгое �
 Последовательная запись в лог, сегменты с индексом, опора на page cache ОС, batch на
 produce/fetch, параллелизм партициями, pull-модель consumer'а. Это не «всё всегда в RAM»,
 а архитектура под последовательный I/O и крупные пачки. См. [§11](#11-почему-kafka-быстрая).
+
+### 16. Клиент «потерял» кластер, брокеры живы. С чего начать?
+
+С маршрутизации, не с «падения Kafka». Проверить `bootstrap.servers`, сеть и особенно
+`advertised.listeners`: в метаданных клиент получает адреса, по которым реально должен
+достучаться. Постоянные `NotLeaderForPartition` / коннекты к внутренним хостам —
+типичный след неверного advertise или устаревшего кэша метаданных. См.
+[§2](#метаданные-и-маршрутизация-клиента).
+
+### 17. Чем JoinGroup/SyncGroup отличается от partition leader? Зачем generation.id?
+
+Partition leader обслуживает чтение/запись партиции. Group coordinator ведёт membership;
+в classic protocol group leader (один из consumer'ов) считает assignment через
+JoinGroup/SyncGroup. `generation.id` инвалидирует commit'ы member'а прошлого поколения
+после rebalance (`ILLEGAL_GENERATION`). См.
+[§6](#group-coordinator-joingroup--syncgroup-generation).
+
+### 18. Почему «всё успешно», а latency выросла?
+
+Частый ответ — квоты: брокер троттлит без exception (`ThrottleTimeMs`). Смотреть
+`produce-throttle-time-avg` / `fetch-throttle-time-avg`. У async producer при длительном
+throttle забивается `buffer.memory` и `send` начинает блокироваться. См.
+[§10](#квоты-и-throttling).
+
+### 19. Зачем `group.instance.id`?
+
+Static membership (KIP-345): при кратком рестарте инстанса с тем же ID координатор
+не обязан сразу разгонять полный rebalance — ждёт возвращения member'а. Снижает шторм
+на rolling deploy. См. [§6](#static-membership-groupinstanceid).
