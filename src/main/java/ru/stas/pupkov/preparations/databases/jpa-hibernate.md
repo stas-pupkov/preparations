@@ -81,15 +81,30 @@ JDBC URL: `jdbc:<subprotocol>:<subname>`, например
 
 ### 2.4. `Statement` vs `PreparedStatement`
 
-Конкатенация строк в SQL ломает грамматику запроса (SQL injection):
+**Проблема:** если пользовательский ввод вшивать в SQL конкатенацией строк, данные
+становятся частью **текста** запроса и могут изменить его грамматику (SQL injection).
+Тот же класс ошибок — хрупкий ручной escape и «динамический» native SQL без bind.
 
 ```text
 login = alice' OR '1'='1
 → WHERE login = 'alice' OR '1'='1' AND ...
 ```
 
-Bind (`?` / named в обёртках) передаёт **значение**, а не фрагмент текста.
-Кэш планов на стороне СУБД — бонус, не главная причина выбора `PreparedStatement`.
+**Верхнеуровнево:**
+
+| | `Statement` | `PreparedStatement` |
+|--|-------------|---------------------|
+| SQL | каждый раз целиком строкой | шаблон с `?` + отдельно значения |
+| Роль данных | легко смешать с синтаксисом | bind: значение ≠ фрагмент SQL |
+| Где уместен | статический SQL без внешнего ввода | почти весь application SQL |
+
+`PreparedStatement` решает главную задачу: **отделить значения от синтаксиса** запроса.
+Повторное выполнение одного шаблона и batch (`addBatch` / `executeBatch`) — удобный
+следствие. Кэш/server-side планы на стороне СУБД — бонус драйвера, не главная причина
+выбора; клиентский `prepareStatement` не всегда равен server-side prepare.
+
+Имя таблицы/колонки через `?` передать нельзя (placeholder только для значений) —
+тогда whitelist идентификаторов, не склейка «что пришло от клиента».
 
 Демо: [JdbcPreparedStatementSemanticsDemo.java](code/JdbcPreparedStatementSemanticsDemo.java).
 
@@ -381,12 +396,97 @@ List<Order> findWithItems(Instant from);
 
 `EAGER` на коллекциях почти всегда вреден: любой `find` тащит граф, часто транзитивно.
 
-### 6.2. LazyInitializationException
+### 6.2. EntityGraph
+
+**Проблема:** ассоциации обычно `LAZY`; нужный граф («заказ + позиции + клиент») надо
+явно подтянуть под use-case. Иначе N+1, `LazyInitializationException` или вредный
+глобальный `EAGER` на mapping’е.
+
+**EntityGraph** (JPA 2.1+) — fetch plan для конкретной операции (`find` / query): «для
+этого вызова считай эти атрибуты eager», без смены `fetch` на entity навсегда.
+
+```text
+Запрос корня (Order)
+    + graph: items, customer
+        → провайдер грузит перечисленные ассоциации
+        → остальные — по типу graph (FETCH / LOAD)
+```
+
+#### Named graph и применение
+
+```java
+@Entity
+@NamedEntityGraph(
+    name = "Order.withItems",
+    attributeNodes = {
+        @NamedAttributeNode("items"),
+        @NamedAttributeNode(value = "customer", subgraph = "customer.details")
+    },
+    subgraphs = @NamedSubgraph(
+        name = "customer.details",
+        attributeNodes = @NamedAttributeNode("addresses")
+    )
+)
+class Order { ... }
+
+EntityGraph<?> graph = em.getEntityGraph("Order.withItems");
+Order order = em.find(Order.class, id,
+    Map.of("jakarta.persistence.fetchgraph", graph));
+// query.setHint("jakarta.persistence.fetchgraph", graph);
+```
+
+#### `FETCH` vs `LOAD`
+
+| Тип hint | Узлы **в** graph | Узлы **вне** graph |
+|----------|------------------|---------------------|
+| **fetchgraph** (`FETCH`) | как `EAGER` | как `LAZY` (игнорируют mapping EAGER) |
+| **loadgraph** (`LOAD`) | как `EAGER` | как в mapping (`LAZY`/`EAGER`) |
+
+`FETCH` жёстче режет граф. `LOAD` — «обязательно догрузи перечисленное, остальное как
+обычно». В Spring Data у `@EntityGraph` default — **`FETCH`**.
+
+#### Spring Data JPA
+
+```java
+@EntityGraph(value = "Order.withItems", type = EntityGraphType.LOAD)
+Optional<Order> findById(Long id);
+
+@EntityGraph(attributePaths = { "items", "customer.addresses" })
+List<Order> findByStatus(OrderStatus status);
+```
+
+Если заданы `attributePaths`, имя named graph игнорируется — динамический graph.
+Разные методы репозитория = разные планы; mapping остаётся `LAZY`.
+
+#### vs `join fetch`
+
+| | `join fetch` | EntityGraph |
+|--|--------------|-------------|
+| Где | текст JPQL | hint / `@EntityGraph` / metadata |
+| Переиспользование | копипаста запроса | named graph на нескольких query |
+| Derived query | неудобно | `@EntityGraph` на `findBy…` |
+| Контроль SQL-shape | явный в JPQL | стратегия у провайдера |
+
+Оба бьют в одну цель. Graph удобнее при многих методах; `join fetch` — когда нужен
+полный контроль над запросом.
+
+#### Ловушки
+
+- Две коллекции в одном graph → cartesian product / `MultipleBagFetchException` (как у
+  двойного collection `join fetch`). Часто: один collection fetch + `@BatchSize` /
+  второй запрос / DTO.
+- Graph не заменяет проекции: для read API часто лучше DTO, чем entity-граф.
+- Hint на **этот** запрос; уже managed в PC под новый graph сами не перезагрузятся.
+- Пагинация + collection в graph — те же грабли, что у [§6.5](#65-пагинация--join-fetch-коллекции).
+
+Практика: mapping `LAZY` → graph / `join fetch` / DTO **внутри** сервиса под use-case.
+
+### 6.3. LazyInitializationException
 
 Доступ к lazy вне активного PC/TX → исключение (если нет OSIV и proxy не инициализирован).
 Лечение: fetch/graph/DTO **внутри** сервиса, а не «открыть Session пошире».
 
-### 6.3. Open Session In View (OSIV)
+### 6.4. Open Session In View (OSIV)
 
 Session/EM живёт на весь HTTP request. Jackson может трогать lazy-поля «успешно», но:
 
@@ -396,7 +496,7 @@ Session/EM живёт на весь HTTP request. Jackson может трога�
 
 В Spring Boot OSIV исторически включён по умолчанию.
 
-### 6.4. Пагинация + `join fetch` коллекции
+### 6.5. Пагинация + `join fetch` коллекции
 
 Хочется одним запросом: страницу родителей (`ORDER BY` + `LIMIT`/`OFFSET`) и их
 коллекции без N+1 (`join fetch`). На практике это конфликтует.
@@ -664,9 +764,58 @@ public void place(Command cmd) {
 
 - `JpaRepository` — proxy; derived query / `@Query` / Specifications / Querydsl.
 - Projections и DTO — предпочтительны для read API.
-- `@EntityGraph` — способ задать fetch под метод.
+- `@EntityGraph` — fetch plan под метод репозитория; подробно [§6.2](#62-entitygraph).
 - `save` на новой vs detached полагается на наличие id / `Persistable` / merge-семантику;
   важно понимать, что происходит под капотом, а не считать `save` универсальным UPSERT.
+
+#### `save` и `saveAndFlush`
+
+`saveAndFlush` — метод **Spring Data JPA** (`JpaRepository`), не JPA-спецификации.
+В `SimpleJpaRepository`:
+
+```java
+@Transactional
+public S saveAndFlush(S entity) {
+    S result = save(entity);
+    flush();          // entityManager.flush()
+    return result;
+}
+```
+
+**1. `save(entity)`**
+
+| Entity «новая» (`isNew` = true) | Иначе |
+|----------------------------------|--------|
+| `em.persist(entity)` → тот же instance | `em.merge(entity)` → **managed** instance |
+
+`isNew` смотрит на id / `Persistable` / `@Version` — отсюда ловушки с assigned id и
+«лишним» `merge`.
+
+**2. `flush()` = `EntityManager.flush()`**
+
+Синхронизация **всего** persistence context с БД прямо сейчас: отложенные
+INSERT/UPDATE/DELETE и dirty checking по **всем** managed entity в PC (не только той, что
+передали в `save`). См. [§7](#7-flush-dirty-checking-generators).
+
+SQL уходит в **текущую** транзакцию. **Commit это не делает**: другие TX при обычном
+isolation строку ещё не увидят. Rollback после flush откатит и эти изменения.
+
+| | `save` | `saveAndFlush` |
+|--|--------|----------------|
+| В PC | да (`persist`/`merge`) | то же |
+| SQL сразу | обычно нет (до auto-flush / commit) | **да**, принудительный flush |
+| Batching / отложенный flush | Hibernate может копить и батчить | flush ограничивает эти оптимизации |
+| Constraint / optimistic lock | часто только на commit | можно поймать **внутри** метода TX |
+
+Когда уместен `saveAndFlush`:
+
+- id/строка нужны в БД **до** native SQL, stored procedure, другого JDBC в той же TX;
+- нужно поймать `OptimisticLockException` / constraint до конца сервиса;
+- редкий `FlushMode.MANUAL` — явная синхронизация.
+
+В обычном CRUD с `@Transactional` и `FlushMode.AUTO` чаще хватает `save` (для уже
+managed — и без `save`, достаточно смены полей). Слепой `saveAndFlush` везде — лишний
+полный dirty check PC и хуже batching. Есть и `saveAllAndFlush`.
 
 Spring Data **JDBC** — отдельная модель (без lazy PC JPA); не путать по названию.
 
@@ -841,3 +990,19 @@ dirty checking на миллионах строк раздувают памят�
 Value object без своей таблицы и `@Id`: поля лежат в колонках entity-владельца
 (`@Embedded`). Lifecycle = родитель. Не путать с `@Entity` / `@OneToOne`. Демо:
 [EmbeddableMappingDemo.java](code/EmbeddableMappingDemo.java). См. [§3.1](#31-embeddable-и-embedded).
+
+### 18. Как работает `saveAndFlush`? Это commit?
+
+Нет. `save` (`persist` или `merge`) + `EntityManager.flush()`: SQL в текущую TX, commit
+отдельно. Flush синхронизирует **весь** PC, не одну entity. Нужен, когда строка должна
+быть в БД до native/procedure в той же TX или чтобы поймать optimistic lock / constraint
+до конца метода. Иначе обычно достаточно `save` / auto-flush. См.
+[§11.2](#112-spring-data-jpa).
+
+### 19. Что такое EntityGraph и чем `fetchgraph` отличается от `loadgraph`?
+
+Fetch plan под операцию: перечисленные атрибуты грузятся как eager, без глобального
+`EAGER` на mapping. **fetchgraph** — узлы вне graph считаются lazy (режет граф).
+**loadgraph** — вне graph остаётся mapping fetch. В Spring Data — `@EntityGraph` /
+`attributePaths` на методе репозитория. Альтернатива — `join fetch` в JPQL. См.
+[§6.2](#62-entitygraph).

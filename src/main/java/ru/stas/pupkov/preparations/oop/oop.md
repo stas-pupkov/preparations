@@ -260,11 +260,90 @@ Account b = new Account(Money.of("100.00"));
 1. **Контракт типа / API** — что можно делать с объектом и что это значит.
    У обычного класса тоже есть интерфейс: набор его публичных методов и их семантика.
 2. **Ключевое слово `interface`** — специальный тип в Java: множественное наследование
-   типов, без полей экземпляра (только константы), с возможностью `default` / `static` /
-   `private` методов начиная с Java 8.
+   типов, без полей экземпляра (только константы), с возможностью `default` / `static`
+   (Java 8) и `private` (Java 9) методов.
 
 Пример: у `ArrayList` есть языковые интерфейсы `List`, `Collection`, … и одновременно
 свой API-контракт (что делает `add`, что будет с `null`, потокобезопасность и т.д.).
+
+### Методы в `interface`: `default`, `static`, `private`
+
+#### `default` — обычный метод с телом внутри интерфейса
+
+Класс, который `implements` интерфейс, **может его не писать** — возьмётся реализация из
+интерфейса. При желании можно переопределить.
+
+Зачем:
+
+- добавить новый метод в старый интерфейс и **не ломать** уже написанные классы;
+- дать общую логику всем реализациям, а в классе оставить только «что своё»
+  (данные / ключевые шаги).
+
+```java
+interface Shipment {
+    String destination();
+    int weightKg();
+
+    default String label() {
+        return destination() + "#" + weightKg() + "kg";
+    }
+}
+```
+
+Нюанс: если два интерфейса дают один и тот же `default`-метод, класс **обязан** сам
+выбрать, какой брать (`Interface.super.method()`).
+
+#### `static` — метод «у самого интерфейса», не у объекта
+
+Вызывается так: `Shipment.of(...)`. Через объект (`s.of(...)`) — нельзя. Классы его
+**не наследуют** и **не переопределяют**.
+
+Зачем: фабрика или утилита рядом с контрактом, без отдельного `ShipmentUtils`.
+
+```java
+interface Shipment {
+    static Shipment of(String destination, int weightKg) {
+        return new SimpleShipment(destination, weightKg);
+    }
+}
+
+Shipment s = Shipment.of("berlin", 12);
+```
+
+В JDK: `Comparator.comparing`, `List.of`, `Predicate.isEqual`.
+
+#### `private` / `private static` — вспомогательный код только внутри интерфейса
+
+Снаружи и в `implements` его **не видно**. Нужен, чтобы не копировать одно и то же в
+нескольких `default`/`static` и не засорять публичный API.
+
+- `private` — для `default`;
+- `private static` — и для `default`, и для `static`;
+- появилось в **Java 9** (`default` / `static` — с **Java 8**).
+
+```java
+interface Shipment {
+    default String label() {
+        return format(destination(), weightKg());
+    }
+
+    private String format(String dest, int kg) {
+        return dest.toUpperCase() + "#" + kg + "kg";
+    }
+}
+```
+
+#### Как выбирать
+
+| Нужно | Что брать |
+|--------|-----------|
+| Новый метод, старые классы не трогаем | `default` |
+| Общее поведение для всех реализаций | `default` |
+| Создать / проверить объект «от имени» интерфейса | `static` |
+| Кусок кода только для себя, наружу не светить | `private` / `private static` |
+| Нужны поля и общее состояние | лучше `abstract class` |
+
+Демо: [InterfaceMethodKindsDemo.java](code/InterfaceMethodKindsDemo.java).
 
 ---
 
@@ -466,7 +545,7 @@ static <T> void addTwice(List<? super T> target, T value) {
 | Наследование | одно | много типов сразу |
 | Состояние | поля экземпляра | только константы (`public static final`) |
 | Конструктор | да | нет |
-| Реализация в типе | обычные и abstract-методы | `default` / `static` / `private` (Java 8+) |
+| Реализация в типе | обычные и abstract-методы | `default` / `static` (Java 8), `private` (Java 9) |
 | Модель | семейство с общим каркасом | роль / способность |
 | Закрытая иерархия | `sealed` | `sealed` |
 
@@ -566,7 +645,7 @@ abstract-методов. Альтернатива «закрыть иерарх�
 Аналогия: арендуешь машину по контракту «можно ехать вперёд и тормозить». Если
 «машина» едет только назад или тормозит только после пароля — формально это тоже
 машина, но контракт нарушен. `extends` / `implements` без LSP — как подпись
-«я `Rectangle`», а внутри — другое поведение.
+«я прямоугольник», а внутри — поведение квадрата.
 
 Формально удобно думать так:
 
@@ -598,9 +677,8 @@ LSP спрашивает не «квадрат — частный случай �
 Другие типичные нарушения:
 
 - метод базы обещает ненулевой результат, override возвращает `null`;
-- override превращается в пустую операцию (no-op), а клиент ждёт эффект;
-- подкласс требует обязательный `init()` до любого использования;
-- «почти коллекция», которая бросает на `add` после создания, хотя тип обещает `List`.
+- override превращается в пустую операцию, а клиент ждёт эффект;
+- подкласс требует обязательный `init()` до любого использования.
 
 Практический вывод: `S extends T` — только если `S` действительно можно использовать
 как `T`. Если «похоже, но ведёт себя иначе» — композиция / отдельный тип, а не
@@ -613,7 +691,7 @@ LSP спрашивает не «квадрат — частный случай �
 
 Поэтому на практике:
 
-- предпочитают композицию и delegation;
+- предпочитают композицию и делегирование;
 - `extends` оставляют для настоящих подтипов с устойчивым контрактом;
 - общие куски выносят в collaborator / package-private helper, а не в
   божественный объект (God-object) базового класса.
@@ -740,7 +818,7 @@ DIP — про **направление** зависимостей. Spring дл�
 servlet-контейнер вызывает контроллер, обработчик событий.
 С контейнером: Spring создаёт бины и управляет lifecycle.
 
-IoC отвечает на «кто главный», а не на «интерфейс или concrete».
+IoC отвечает на «кто главный», а не на «интерфейс или конкретный класс».
 
 ### DI
 
@@ -806,6 +884,7 @@ IoC отвечает на «кто главный», а не на «интерф
 | [CompositionVsAggregationDemo.java](code/CompositionVsAggregationDemo.java) | владение lifecycle |
 | [PolymorphismKindsDemo.java](code/PolymorphismKindsDemo.java) | subtype / ad hoc / parametric |
 | [AbstractVsInterfaceDemo.java](code/AbstractVsInterfaceDemo.java) | роль vs Template Method |
+| [InterfaceMethodKindsDemo.java](code/InterfaceMethodKindsDemo.java) | `default` / `static` / `private` в interface |
 | [LspViolationDemo.java](code/LspViolationDemo.java) | Square/Rectangle и контракт |
 | [DipVsIocDemo.java](code/DipVsIocDemo.java) | DIP vs IoC vs DI на одном сценарии |
 
@@ -950,7 +1029,7 @@ Keep It Simple, Stupid: не добавляй сложность, пока он�
 ждут пример «достаточного» решения против overengineering (лишние слои, паттерны «на
 вырост»). Рядом YAGNI и осторожный DRY.
 
-### 14. Почему «внедрили concrete через конструктор» — ещё не DIP?
+### 14. Почему «внедрили конкретный класс через конструктор» — ещё не DIP?
 
 DI отвечает «кто создал и передал объект». DIP — «на какой тип смотрит high-level модуль».
 Если тип зависимости — конкретный `SmtpMailer`, стрелка по-прежнему идёт на деталь:

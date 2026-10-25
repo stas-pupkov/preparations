@@ -170,6 +170,65 @@ byte b1 = 1, b2 = 2;
 byte sum = (byte) (b1 + b2);
 ```
 
+#### Widening / narrowing reference подробнее
+
+Иерархия: `Dog extends Animal`, `Cat extends Animal` (общего между `Dog` и `Cat` нет).
+
+**`Animal a = new Dog();` — widening reference**
+
+- **Compile-time тип** переменной `a` — `Animal` (что компилятор разрешает вызывать).
+- **Runtime-тип** объекта в куче — `Dog` (кто объект на самом деле).
+
+Расширение вверх по иерархии всегда безопасно: каждый `Dog` — это `Animal`. Приведение
+писать не нужно — достаточно присваивания. Через `a` видны только методы `Animal`;
+специфику `Dog` компилятор не даст вызвать, пока тип ссылки — `Animal`.
+
+**`Dog d = (Dog) a;` — narrowing reference, ok**
+
+Сужение: «считаем, что за `Animal` на самом деле стоит `Dog`».
+
+1. **Компилятор** разрешает `(Dog) a`, потому что `Dog` — подтип `Animal`: такой cast
+   *может* быть верным. Если типы несовместимы по иерархии (`String` → `Integer`), будет
+   ошибка компиляции, а не `ClassCastException`.
+2. **JVM в runtime** смотрит на реальный объект: это `Dog` → приведение успешно
+   (байткод `checkcast`).
+
+После этого у `d` compile-time тип — `Dog`: можно звать методы собаки. Объект тот же,
+поменялась только «линза» ссылки.
+
+**`Cat c = (Cat) a;` — `ClassCastException`**
+
+1. **Компилятор** снова пропускает: `Cat` тоже наследник `Animal`, теоретически возможно.
+2. **JVM** видит объект типа `Dog`. `Dog` не является `Cat` → `ClassCastException`.
+
+Успешность narrowing для ссылок решает **не** тип переменной `a`, а **runtime-тип
+объекта**. Тип переменной лишь задаёт, какие cast’ы вообще компилируются.
+
+```text
+ссылка a : Animal  ──►  объект : Dog
+                │
+     (Dog) a ───┼──► ok, Dog совместим с Dog
+     (Cat) a ───┴──► ClassCastException
+```
+
+Безопасный вариант — проверить runtime-тип до приведения:
+
+```java
+if (a instanceof Dog d) {  // Java 16+
+    d.bark();
+}
+// или классика: if (a instanceof Dog) { Dog d = (Dog) a; ... }
+```
+
+Зачем narrowing: API отдаёт базовый тип (`Animal`, `Object`, `List`), а дальше нужна
+семантика конкретного подтипа. Без проверки — хрупко; с `instanceof` / sealed + `switch` —
+контролируемо.
+
+Отличие от narrowing primitive (`long` → `int`): там нет проверки «совместимости объекта»,
+старшие биты просто обрезаются — исключения не будет.
+
+Демо: [ReferenceCastingDemo.java](code/ReferenceCastingDemo.java).
+
 ---
 
 ## 3. Autoboxing и обёртки
@@ -542,6 +601,8 @@ record Err(String message) implements Result { }
 
 Нельзя объявить abstract-метод интерфейса `final`. Маркеры (`Serializable`, `Cloneable`)
 остаются в JDK; в новом коде чаще annotations.
+
+См. также [`java8.md` §6](../java8/java8.md#6-default-и-static-методы-в-интерфейсах).
 
 ---
 
@@ -1100,7 +1161,6 @@ List<String> strings = new ArrayList<>();
 | `T` без bound | `Object` |
 | `T extends Number` | `Number` |
 | `T extends A & B` | leftmost bound `A` |
-| `T[]` | `|T|[]` |
 
 ```java
 List<String> a = new ArrayList<>();
@@ -1313,6 +1373,7 @@ Inference (Java 8+ targets / poly expressions) обычно «просто ра�
 | [NestedClassesCaptureDemo.java](code/NestedClassesCaptureDemo.java) | static nested vs inner, effectively final |
 | [ClassInitOrderDemo.java](code/ClassInitOrderDemo.java) | порядок init, `ExceptionInInitializerError` |
 | [AutoboxingCacheDemo.java](code/AutoboxingCacheDemo.java) | Integer cache, `==`, NPE unboxing |
+| [ReferenceCastingDemo.java](code/ReferenceCastingDemo.java) | widening/narrowing reference, `checkcast`, `instanceof` |
 | [ExceptionFinallyTwrsDemo.java](code/ExceptionFinallyTwrsDemo.java) | finally+return, multi-catch order, suppressed |
 | [SwitchOnStringDemo.java](code/SwitchOnStringDemo.java) | case-sensitive, `switch(null)`, expression |
 | [GenericsPecsErasureDemo.java](code/GenericsPecsErasureDemo.java) | invariance, PECS, erasure, heap pollution, capture helper |
