@@ -45,7 +45,7 @@ TX / N+1 — [jpa-hibernate.md](../databases/jpa-hibernate.md) (Spring Data JPA 
 снаружи (через конструктор / setter / поле), а не через `new` внутри класса.
 
 **IoC-контейнер Spring** — `BeanFactory` (базовый контракт) и `ApplicationContext`
-(корпоративная надстройка: события, интернационализация (i18n), ресурсы, интеграция с
+(корпоративная надстройка: события, ресурсы, интеграция с
 AOP/Boot). В Boot почти всегда имеем дело с `ApplicationContext`.
 
 Способы DI:
@@ -946,10 +946,36 @@ public void transfer(Account from, Account to, Money amount) { /* ... */ }
 ```
 
 Аномалии (dirty / non-repeatable / phantom) — свойство СУБД + isolation; Spring прокидывает
-`Connection.setTransactionIsolation`. `readOnly = true` — hint (flush / routing), не замена
-isolation.
+`Connection.setTransactionIsolation`. Про `readOnly` — отдельно в [§7.4](#74-readonly).
 
-### 7.4. Комбинации propagation + isolation
+### 7.4. `readOnly`
+
+`@Transactional(readOnly = true)` — **hint для инфраструктуры**, не запрет записи и не
+замена isolation. Spring кладёт флаг в `TransactionDefinition`; дальше поведение зависит
+от `PlatformTransactionManager` / ORM / драйвера.
+
+Что обычно даёт на практике:
+
+| Слой | Эффект |
+|------|--------|
+| **JPA / Hibernate** | Главный выигрыш: меньше flush перед запросами, слабее dirty checking. Чистое чтение дешевле, меньше «случайного» SQL от flush |
+| **JDBC** | При поддержке — `Connection.setReadOnly(true)`. СУБД/драйвер могут упростить план или отказать в DML; **гарантии нет** |
+| **Routing** | Часто сигнал для `AbstractRoutingDataSource`: read → replica, write → primary. Это договорённость приложения/инфры, не магия TM сама по себе |
+
+Чего **не** делает:
+
+- не делает метод «только SELECT» на уровне Spring — запись из `readOnly`-метода часто
+  пройдёт, пока Hibernate/БД явно не зарубят;
+- не задаёт isolation и не закрывает dirty / non-repeatable / phantom;
+- при join к уже открытой write-tx (`REQUIRED`) inner `readOnly` **обычно не переводит**
+  outer в readonly — флаг в основном действует, когда tx **создаётся**.
+
+Практика: на сервисах чтения (`find*`, отчёты, dashboard) ставить `readOnly = true`.
+Критичную consistency по-прежнему закрывать isolation / `REQUIRES_NEW` / явной моделью,
+а не `readOnly`. Демо комбинаций — в
+[TransactionPropagationIsolationDemo.java](code/TransactionPropagationIsolationDemo.java).
+
+### 7.5. Комбинации propagation + isolation
 
 **Checkout + аудит** (частый кейс на собесе):
 
@@ -989,7 +1015,7 @@ public void heavyRead() { /* ... */ }
 Runnable со всеми сценариями и логами TM:
 [TransactionPropagationIsolationDemo.java](code/TransactionPropagationIsolationDemo.java).
 
-### 7.5. Почему «транзакция не работает»
+### 7.6. Почему «транзакция не работает»
 
 1. Самовызов / `private` / `final`.
 2. Метод вызван не через Spring-бин (ручной `new`, вызов из другого потока без передачи прокси).
@@ -1041,7 +1067,7 @@ static class Config {
 Связка с JPA: границы транзакции определяют, жив lazy-loading и когда выполняется flush;
 подробности — в jpa-hibernate заметке.
 
-### 7.6. `@Async` и `@Transactional`
+### 7.7. `@Async` и `@Transactional`
 
 Transaction sync — **ThreadLocal**. `@Async` уводит выполнение в **другой поток**, поэтому:
 
@@ -1368,6 +1394,10 @@ service.users.findByEmailAndActiveTrue("a@b.c")
 
 ### 10.4. Derived query
 
+Способ объявить запрос **именем метода** интерфейса репозитория — без `@Query` и без
+ручного JPQL/SQL. Spring Data на старте разбирает имя и собирает store-specific запрос
+(для JPA — Criteria/JPQL под капотом).
+
 ```java
 List<User> findByEmailIgnoreCaseAndActiveTrue(String email);
 ```
@@ -1377,8 +1407,14 @@ List<User> findByEmailIgnoreCaseAndActiveTrue(String email);
    `Between`, `True`/`False`, `OrderBy`…).
 3. Модуль строит store-specific запрос.
 
-Ограничения: длинные имена, слабая булева выразительность → `@Query` / `Specification` /
-Querydsl. Свойство должно существовать в модели — иначе падение **на старте**.
+**Зачем:** быстрые типовые finder’ы по полям модели без boilerplate; единый стиль API
+репозитория; fail-fast — нет свойства / опечатка в имени → падение **на старте**, не в
+рантайме. В lookup-цепочке (default `CREATE_IF_NOT_FOUND`) derived — fallback, если нет
+`@Query` / named query (см. [§10.3](#103-query-lookup)).
+
+**Граница:** длинные имена, сложная булева логика, нетривиальные join’ы, DTO «как надо» —
+уже `@Query`, `Specification`, Querydsl или кастомный фрагмент репозитория. Derived —
+удобный слой для простых предикатов, не замена полноценному query language.
 
 ### 10.5. `@Query`, `SimpleJpaRepository`, кастом
 
@@ -1570,11 +1606,90 @@ security — как у `@Transactional`.
 | CSRF | обычно нужен | часто off при чистом Bearer |
 | Инвалидация | invalidate session | short TTL / denylist / refresh |
 
-CSRF: при cookie-session браузер сам шлёт cookie → нужен token. При чистом
-`Authorization: Bearer` автоматом не шлётся → CSRF обычно отключают вместе со
-`STATELESS`. Антипаттерн: `csrf.disable()` + cookie form login «потому что JSON».
+CSRF и CORS — **разные** проблемы. Путать их на собесе / в конфиге — частая ошибка.
 
-CORS preflight (`OPTIONS`) должен пройти до жёсткой auth, иначе UI «не логинится».
+#### CSRF (Cross-Site Request Forgery)
+
+Атака: жертва залогинена на `bank.com` (сессия в **cookie**). Открывает `evil.com` →
+страница шлёт запрос на `bank.com/transfer`. Браузер **сам** прикладывает cookie
+`bank.com`. Сервер видит валидную сессию и выполняет действие от имени пользователя.
+Злоумышленник cookie не крадёт — заставляет браузер **использовать** уже установленную
+аутентификацию.
+
+Почему cookie-session уязвим: credentials едут автоматически с каждым запросом к origin.
+Достаточно инициировать state-changing запрос (POST/PUT/DELETE) с чужой страницы.
+
+Защита — **синхронизатор токена**: сервер выдаёт непредсказуемый CSRF-token (форма / meta /
+cookie + header). Изменяющий запрос обязан принести token. `evil.com` сессионную cookie
+иногда «подцепит», а token из DOM вашего origin прочитать не может (SOP) → запрос без
+валидного token отклоняется.
+
+В Spring Security: `CsrfFilter`. Для SPA типично cookie `XSRF-TOKEN` + заголовок
+`X-XSRF-TOKEN` (клиент копирует значение в header).
+
+Дополнительно:
+
+- `SameSite=Lax` / `Strict` на session cookie сильно режет классический CSRF с чужого
+  сайта; не полная замена token во всех сценариях (поддомены, легальный cross-site с
+  `SameSite=None; Secure`, старые клиенты);
+- safe methods (`GET`…) по договорённости без побочных эффектов — CSRF бьёт в изменяющие
+  операции;
+- проверки `Origin` / `Referer` — доп. слой, не единственная защита.
+
+Когда `csrf.disable()` оправдан: **stateless API** с auth только в
+`Authorization: Bearer …` — браузер сам Bearer с `evil.com` не приложит. Обычно вместе с
+`SessionCreationPolicy.STATELESS`.
+
+Антипаттерн: `csrf.disable()` + form-login / cookie-session «потому что JSON API». JSON не
+спасает — cookie всё равно уедет с запросом.
+
+#### CORS (Cross-Origin Resource Sharing)
+
+**Same-Origin Policy**: JS с `https://app.example` не читает ответ с другого origin
+(схема / host / port). Это защита данных **в браузере**, не серверный ACL.
+
+CORS — opt-in: сервер заголовками разрешает браузеру отдать ответ JS с другого origin.
+
+- «Простой» запрос — сразу уходит; браузер смотрит `Access-Control-Allow-Origin` на ответе.
+- Иначе — **preflight** `OPTIONS`: можно ли метод + кастомные заголовки
+  (`Authorization`, `Content-Type: application/json`, …). Сервер отвечает
+  `Allow-Origin` / `Allow-Methods` / `Allow-Headers` (+ при необходимости
+  `Allow-Credentials`, `Max-Age`), затем идёт основной запрос.
+
+| Заголовок | Смысл |
+|-----------|--------|
+| `Access-Control-Allow-Origin` | какой origin может читать ответ (`*` или конкретный) |
+| `Access-Control-Allow-Credentials` | cookies / `credentials: 'include'` |
+| `Allow-Methods` / `Allow-Headers` | что разрешено после preflight |
+| `Access-Control-Expose-Headers` | какие response headers видны JS |
+
+Нюанс: `Allow-Origin: *` **несовместим** с `Allow-Credentials: true`. Для cookie
+cross-origin нужен **конкретный** origin.
+
+CORS **не** заменяет аутентификацию/авторизацию: сервер без браузера бьёт в API напрямую.
+CORS ограничивает чужой фронт **в браузере пользователя**.
+
+В Spring: `CorsConfiguration` / `@CrossOrigin` / `CorsFilter` / `http.cors { }` в Security.
+Preflight должен пройти **до** жёсткой auth (`OPTIONS` → 200 + CORS headers), иначе UI
+«не логинится» при живом API.
+
+#### CSRF ≠ CORS
+
+| | CSRF | CORS |
+|--|------|------|
+| Суть | сервер выполняет чужое действие от жертвы | браузер не отдаёт ответ JS с другого origin |
+| Рычаг | автоматические credentials (cookie) | SOP + opt-in заголовки сервера |
+| Лечится ли «настройкой CORS» | нет | — |
+| Лечится ли `csrf.disable()` | — | нет |
+
+Типичные связки:
+
+1. SPA на другом origin + JWT в header → CORS (конкретные origins), CSRF off, STATELESS.
+2. Classic MVC + session cookie, same origin → CSRF on, CORS часто не нужен.
+3. SPA + session cookie cross-origin → CORS с credentials + конкретный origin **и** CSRF
+   (сложнее; часто избегают в пользу Bearer).
+
+Cookie-флаги и два мира сессий — также [§15](#15-http-cookie).
 
 ### 11.8. JWT resource server (схема)
 
@@ -1590,15 +1705,45 @@ Resource server проверяет token; Authorization server выдаёт. Э�
 
 ### 11.9. Ловушки
 
-1. Несколько chain без `securityMatcher`.
-2. Role prefix: в токене `ADMIN`, в правиле `hasRole('ADMIN')` → 403.
-3. CSRF off + cookie session.
-4. `SecurityContext` пуст в `@Async`.
-5. Self-invocation ↔ `@PreAuthorize`.
-6. Забыли `permitAll` на `/error` → циклы при ошибках.
-7. Actuator открыт без отдельной политики.
+1. **Несколько `SecurityFilterChain` без `securityMatcher`.**  
+   Без `securityMatcher("/api/**")` и т.п. цепочки претендуют на все запросы. Порядок бинов /
+   `@Order` решает, какая сработает первой; остальные могут «молчать». Итог — не те правила,
+   часть эндпоинтов открыта или закрыта иначе, чем ожидаешь. Каждой chain — явный matcher и
+   понятный порядок.
 
-Положение в стеке:
+2. **Role prefix: в токене `ADMIN`, в правиле `hasRole('ADMIN')` → 403.**  
+   `hasRole("ADMIN")` ищет authority **`ROLE_ADMIN`**. `hasAuthority("ADMIN")` — строку
+   `ADMIN` как есть. В JWT/claims часто голое `ADMIN` → `hasRole` не находит → 403 при живой
+   аутентификации. Класть `ROLE_…` в token/`UserDetails`, писать `hasAuthority` или настроить
+   mapper / `JwtAuthenticationConverter`.
+
+3. **CSRF off + cookie session.**  
+   `csrf.disable()` безопасен при чистом Bearer + STATELESS. Если сессия в cookie (form-login,
+   JSESSIONID), браузер сам шлёт cookie с чужого сайта → CSRF без защиты. JSON API сам по себе
+   не спасает. См. [§11.7](#117-session-vs-jwt--csrf--cors).
+
+4. **`SecurityContext` пуст в `@Async`.**  
+   По умолчанию `SecurityContextHolder` — ThreadLocal. `@Async` уходит на другой поток →
+   `getAuthentication()` = null, ломаются `@PreAuthorize` / аудит «от имени пользователя».
+   Нужны `MODE_INHERITABLETHREADLOCAL`, executor с пропагацией
+   (`DelegatingSecurityContextRunnable`) или явная передача principal.
+
+5. **Self-invocation ↔ `@PreAuthorize`.**  
+   Method security — AOP-прокси. `this.securedMethod()` обходит proxy → `@PreAuthorize` не
+   срабатывает (как у `@Transactional` / `@Cacheable`). Вызов через другой бин, self-inject
+   (`@Lazy`) или разнести методы по классам.
+
+6. **Забыли `permitAll` на `/error` → циклы при ошибках.**  
+   Ошибка → Boot/контейнер ведёт на `/error`. Если `/error` тоже требует auth, а пользователь
+   не аутентифицирован — снова 401/403 → снова `/error` → цикл / странный UX. Обычно `/error`
+   (и иногда login/статика) в `permitAll`, плюс аккуратные entry/denied handlers.
+
+7. **Actuator открыт без отдельной политики.**  
+   `/actuator/**` (env, heapdump, shutdown…) опаснее публичного API. На проде — отдельный
+   `SecurityFilterChain` / жёсткие `requestMatchers`, сеть, минимум exposure; не смешивать с
+   политикой «как у `/api/health`».
+
+Положение в стеке (ловушки 1–3, 6–7 — в основном filter chain; 4–5 — ThreadLocal и proxy):
 
 ```text
 Security filters → DispatcherServlet → Controller
@@ -1646,6 +1791,11 @@ Security filters → DispatcherServlet → Controller
 
 ## 14. REST и SOAP
 
+**REST** (Representational State Transfer) — архитектурный стиль Роя Филдинга для
+распределённых гипермедиа-систем. **RESTful** в обиходе — API, следующее этим идеям
+(обычно поверх HTTP). Строгий REST (с HATEOAS) и «JSON по HTTP» на проде — разные уровни;
+на собесе важно уметь их развести.
+
 | | REST (часто HTTP + JSON) | SOAP |
 |--|--------------------------|------|
 | Стиль | ресурсы и глаголы HTTP | RPC-операции в XML-конверте |
@@ -1669,8 +1819,50 @@ GET /orders/42
 SOAP — XML-сообщение с `Envelope` / `Body` и операцией вроде `PlaceOrder`. Строже
 контракт и tooling, тяжелее читать и дебажить.
 
-«RESTful» на собесе: осмысленные ресурсы, правильные методы и коды, идемпотентность
-`GET`/`PUT`/`DELETE`. HATEOAS на практике встречается редко.
+### 14.1. Ограничения REST (Fielding)
+
+| Constraint | Смысл |
+|------------|--------|
+| **Client–Server** | UI и хранение/логика разделены |
+| **Stateless** | каждый запрос самодостаточен; сервер не держит клиентскую сессию как обязательную часть протокола (auth — в запросе) |
+| **Cache** | ответы явно cacheable / non-cacheable |
+| **Uniform interface** | единый контракт взаимодействия (см. ниже) |
+| **Layered system** | клиент не обязан знать про proxy/gateway за «сервером» |
+| **Code on Demand** (опц.) | сервер может отдавать исполняемый код; в типичных HTTP API почти не используют |
+
+**Uniform interface:**
+
+1. **Ресурсы** — идентифицируемые сущности (`/orders/42`), не RPC-глаголы в URL как
+   единственная модель (`/doCreateOrder` — ant-pattern относительно REST).
+2. **Представления (representations)** — ресурс ≠ JSON; то же можно отдать как JSON/XML
+   через `Accept` / content negotiation.
+3. **Самоописывающие сообщения** — метод, статус, заголовки, media type несут смысл.
+4. **HATEOAS** — переходы через ссылки в ответах, а не только захардкоженные URL в клиенте.
+   У большинства «REST API» этого нет → это скорее HTTP resource API, не полный REST.
+
+### 14.2. Практический чеклист «RESTful»
+
+1. **Ресурсная модель** — существительные, иерархия по смыслу: `/users/1/orders`.
+2. **HTTP-методы по семантике**
+   - `GET` — чтение, безопасный, идемпотентный;
+   - `POST` — создание / неидемпотентная операция;
+   - `PUT` — полная замена представления (идемпотентен);
+   - `PATCH` — частичное изменение;
+   - `DELETE` — удаление (идемпотентен по смыслу повтора).
+3. **Статус-коды** — `201` + `Location` при создании, `204` без тела, `400`/`404`/`409`/`422`,
+   `401`/`403`; не всё подряд `200` с ошибкой в JSON (если нет осознанного envelope).
+4. **Идемпотентность и безопасность** — ретраи безопасны на `GET`/`PUT`/`DELETE`.
+5. **Stateless на уровне API** — идентификация/права в каждом запросе (часто Bearer).
+6. **Кэш** — `Cache-Control` / `ETag` / `Last-Modified` там, где чтение массовое.
+7. **Единообразие ошибок и media types** — предсказуемый problem+json и т.п.
+8. **(Строгий REST)** HATEOAS / hypermedia controls.
+
+Richardson Maturity Model (грубо): 0 — RPC через один URL → 1 — ресурсы → 2 — глаголы HTTP +
+коды → 3 — hypermedia. Большинство Spring-сервисов — **уровень 2**.
+
+Чем RESTful **не** обязан быть: только JSON; CRUD 1:1 с таблицами; обязательный HATEOAS в
+каждом enterprise API. Версиирование (`/v1/` vs header) — engineering trade-off, не запрет
+REST.
 
 ---
 
@@ -1704,6 +1896,8 @@ Cookie: SESSION=abc
 - **Bearer JWT** — клиент кладёт токен в заголовок сам → CSRF обычно не про cookie.
 
 Антипаттерн: выключить CSRF и оставить form-login на cookie «потому что у нас JSON API».
+
+Разбор CSRF vs CORS, preflight и Spring-конфиг — [§11.7](#117-session-vs-jwt--csrf--cors).
 
 ---
 
@@ -2053,11 +2247,18 @@ JPA — спека persistence; Hibernate — провайдер. Spring Data �
 store (в т.ч. JPA). Data не заменяет ORM: без EntityManager/Hibernate Data JPA не работает.
 Data JDBC / Mongo — другие модули с похожим API репозитория.
 
-### 23. Как Spring превращает `findByEmail` в запрос?
+### 23. Как Spring превращает `findByEmail` в запрос? Зачем derived query?
 
-На старте `QueryLookupStrategy` (обычно `CREATE_IF_NOT_FOUND`): нет `@Query`/named → парсинг
-имени → store-specific `RepositoryQuery`. Вызов идёт в `QueryExecutorMethodInterceptor` →
-execute. Ошибка в имени свойства — fail при подъёме контекста.
+Derived query: имя метода → предикаты по свойствам entity → store-specific запрос, без
+`@Query`. Нужен для типовых finder’ов без boilerplate и с fail-fast на старте. Сложная
+логика / join’ы / длинные имена — `@Query` / `Specification` / Querydsl / кастом.
+
+Механика: на старте `QueryLookupStrategy` (обычно `CREATE_IF_NOT_FOUND`): нет `@Query`/named
+→ парсинг имени → store-specific `RepositoryQuery`. Вызов — `QueryExecutorMethodInterceptor`
+→ execute. Ошибка в имени свойства — fail при подъёме контекста. При
+`USE_DECLARED_QUERY` метод без declared query на старте упадёт. См.
+[§10.3](#103-query-lookup), [§10.4](#104-derived-query).
+
 
 ### 24. Зачем `@Transactional` на `SimpleJpaRepository`, если TX на сервисе?
 
@@ -2087,10 +2288,15 @@ auth, `AuthorizationFilter`, exception translation) → затем MVC. `Authent
 `hasRole` ищет authority с префиксом `ROLE_` → `ROLE_ADMIN`. `hasAuthority` — точное совпадение
 строки. Типичный баг: в JWT claim `ADMIN`, в правиле `hasRole('ADMIN')` → 403.
 
-### 29. Когда отключать CSRF?
+### 29. Когда отключать CSRF? Чем CSRF отличается от CORS?
 
-Оправдано для stateless API с Bearer (браузер сам не приложит token). Опасно отключать при
-cookie-session / form login. CSRF и CORS — разные проблемы.
+CSRF off оправдан для stateless API с чистым Bearer (браузер сам не приложит token). Опасно
+при cookie-session / form login. JSON API сам по себе CSRF не отменяет.
+
+CSRF — подделка запроса от имени жертвы за счёт автоматических cookie. CORS — разрешение
+браузеру читать ответ другого origin (SOP); не замена auth и не лечение CSRF. Preflight
+`OPTIONS` должен пройти до жёсткой auth. `Allow-Origin: *` несовместим с
+`Allow-Credentials: true`. См. [§11.7](#117-session-vs-jwt--csrf--cors).
 
 ### 30. Почему `@PreAuthorize` не сработал при вызове из того же класса?
 
@@ -2127,3 +2333,17 @@ Cookie-session: сервер хранит сессию, удобный logout, �
 Liveness: «процесс пора перезапустить». Readiness: «пока не готовы принимать трафик».
 Готовый health с падением БД на liveness может устроить рестарт-луп — часто БД только в
 readiness. См. [§22](#22-actuator-в-docker--k8s).
+
+### 36. Что даёт `@Transactional(readOnly = true)`?
+
+Hint, не запрет записи и не замена isolation. На практике: Hibernate меньше flush / dirty
+checking; JDBC может выставить `Connection.setReadOnly(true)`; часто сигнал для routing
+на replica. Запись из такого метода Spring сам не блокирует. При join к write-`REQUIRED`
+inner `readOnly` обычно не переводит outer в readonly. См. [§7.4](#74-readonly).
+
+### 37. Что такое RESTful и каким требованиям должно соответствовать API?
+
+REST — стиль Филдинга (stateless, cache, uniform interface, …). RESTful на практике —
+ресурсная модель, семантика HTTP-методов и кодов, идемпотентность `GET`/`PUT`/`DELETE`,
+часто stateless auth. HATEOAS = полный REST; у большинства сервисов его нет (Richardson
+уровень 2). `GET /orders/delete/42` — не RESTful и опасно для кэша/ретраев. См. [§14](#14-rest-и-soap).
