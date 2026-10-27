@@ -372,7 +372,8 @@ static class Config {
 3. Создание экземпляра (instantiation) — конструктор / factory-method. **Фаза 1:** полей
    от DI / кастомных BPP ещё нет.
 4. Наполнение зависимостями (population / DI) — `@Autowired`, `@Value`, …
-5. Обратные вызовы `*Aware` (`BeanNameAware`, `BeanFactoryAware`, `ApplicationContextAware`, …).
+5. Обратные вызовы `*Aware` (`BeanNameAware`, `BeanFactoryAware`, `ApplicationContextAware`, …)
+   — см. ниже.
 6. `BeanPostProcessor.postProcessBeforeInitialization` — кастомный inject, чтение аннотаций
    *до* возможного proxy.
 7. Инициализация (**фаза 2**): `@PostConstruct` → `InitializingBean.afterPropertiesSet` →
@@ -380,6 +381,27 @@ static class Config {
 8. `BeanPostProcessor.postProcessAfterInitialization` — часто **оборачивание в прокси**.
 9. Бин в контейнере; после полного refresh — **фаза 3** (`ContextRefreshedEvent`).
 10. Уничтожение: `@PreDestroy` → `DisposableBean.destroy` → `destroyMethod`.
+
+**`*Aware` — callback'и контейнера.** Это не отдельный «тип бинов», а маркерные интерфейсы:
+бин заявляет «нужен доступ к куску контейнера / метаданным о себе», Spring на шаге 5
+вызывает setter и передаёт зависимость. К этому моменту обычный DI уже выполнен; до
+`@PostConstruct` и proxy ещё далеко — тяжёлую логику в `setApplicationContext` не кладут.
+
+| Интерфейс | Что получает |
+|-----------|----------------|
+| `BeanNameAware` | id/имя бина в фабрике |
+| `BeanFactoryAware` | `BeanFactory` (lookup, прототипы «вручную») |
+| `ApplicationContextAware` | весь `ApplicationContext` (события, бины, ресурсы) |
+| `EnvironmentAware` | `Environment` / профили / property sources |
+| `ResourceLoaderAware` | загрузка ресурсов |
+| `ApplicationEventPublisherAware` | публикация событий (часто уже хватает DI `ApplicationEventPublisher`) |
+| `ServletContextAware` / `ServletConfigAware` | web-контекст (если есть) |
+| `EmbeddedValueResolverAware` | резолв плейсхолдеров `${…}` |
+
+Уместны во фреймворк-/инфраструктурном коде и редком динамическом lookup. В бизнес-сервисах
+`ApplicationContextAware` обычно избегают: скрытый service locator, хуже тесты, жёсткая
+связность с контейнером. Предпочтительнее явный DI нужного типа (`Environment`,
+`ApplicationEventPublisher`, конкретный бин), а не «достать любой бин через context».
 
 | Фаза | Когда | Что уже есть | Чего ещё нет |
 |------|--------|--------------|--------------|
@@ -2100,6 +2122,7 @@ init того же экземпляра идёт мимо прокси. Плюс
 `@PostConstruct` слишком ранний. Надёжнее: отдельный бин, `ApplicationRunner`, либо осознанный
 self-прокси после полного поднятия.
 
+
 ### 3. Почему `@Transactional` на `private` методе не работает в режиме proxy?
 
 Прокси перехватывает *внешние* вызовы к переопределяемым методам. `private` не входит в
@@ -2347,3 +2370,9 @@ REST — стиль Филдинга (stateless, cache, uniform interface, …).
 ресурсная модель, семантика HTTP-методов и кодов, идемпотентность `GET`/`PUT`/`DELETE`,
 часто stateless auth. HATEOAS = полный REST; у большинства сервисов его нет (Richardson
 уровень 2). `GET /orders/delete/42` — не RESTful и опасно для кэша/ретраев. См. [§14](#14-rest-и-soap).
+
+### 38. Что делают интерфейсы `*Aware`?
+
+Callback'и контейнера после DI и до BPP.before / `@PostConstruct`: бин получает имя,
+`BeanFactory`, `ApplicationContext`, `Environment` и т.д. через setter. В бизнес-коде лучше
+явный DI нужного типа, чем `ApplicationContextAware` как service locator. См. [§3.2](#32-цепочка-одного-singleton).
