@@ -194,10 +194,40 @@ heap и открытые ресурсы, у каждого свой стек (и
 **Green threads** — потоки, которые планирует runtime, а не ОС (один OS-thread на много
 green). В классической JVM они ушли после Java 1.2 в пользу native (platform) threads.
 
-С **Java 21** появились **virtual threads** (Project Loom): лёгкие потоки JVM, которые
-mount/unmount на carrier (platform) threads. Это не возврат старых green threads один в один,
-но идея «много логических потоков на мало OS-threads» снова актуальна. Для I/O-bound
-нагрузки virtual threads часто снимают нужду в огромных пулах platform threads.
+### Virtual threads (Java 21+)
+
+**Platform thread** — обычный «тяжёлый» поток ОС. Их относительно мало (сотни–тысячи),
+каждый занимает заметную память. Пока поток ждёт ответ БД или сети, слот всё равно занят —
+он стоит и ничего полезного не делает.
+
+**Virtual thread (VT)** — лёгкий поток внутри JVM (Project Loom). Настоящих OS-потоков
+под капотом мало (**carrier threads**), а виртуальных можно завести очень много.
+Когда VT ждёт I/O, JVM обычно снимает его с carrier и отдаёт carrier другой задаче:
+ждущих может быть десятки тысяч, а реальных OS-потоков — десятки.
+
+Аналогия: обычные потоки — выделенные кассы (клиент ушёл за справкой — касса пустует).
+VT — талончики: кассиров мало, но пока один «ждёт справку», кассир обслуживает следующего.
+
+**Зачем:** писать простой код «один запрос — один поток» на **I/O-bound** нагрузке
+(HTTP, JDBC, файлы, `sleep`), не упираясь в лимит OS-потоков. Часто снимают нужду
+в гигантских пулах platform threads. В Spring Boot 3.2+ — опция вроде
+`spring.threads.virtual.enabled=true` (серверные потоки на VT).
+
+**Когда не помогают:** долгий CPU-bound счёт. Считают всё те же ядра; VT его не ускорят.
+
+**Не путать:** VT снимают дефицит *потоков*, не дефицит *ресурсов*. Миллион VT к БД
+с пулом из 20 соединений всё равно упрётся в эти 20 соединений — VT тут не магия.
+Пулы/семафоры по-прежнему нужны, чтобы ограничить доступ к scarce resources
+(connections, CPU-heavy участки).
+
+Нюансы (кратко):
+- **Pinning** — в части случаев VT не отцепляется от carrier (классика: долгий
+  `synchronized` / native). Carrier тогда «залипает» вместе с ожиданием.
+- VT — daemon, приоритет фиксирован, имя по умолчанию пустое.
+- Массовый `ThreadLocal` на миллионах VT дорог и часто неудобен по lifecycle.
+
+Это не возврат старых green threads один в один, но идея «много логических потоков
+на мало OS-threads» снова актуальна.
 
 Способы запуска задачи:
 
@@ -230,7 +260,8 @@ try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
 потоке. Принудительно заставить планировщик немедленно исполнить поток нельзя — только
 `start()` и дальше политика ОС/JVM.
 
-Демо: [StartVsRunDemo.java](code/StartVsRunDemo.java).
+Демо: [StartVsRunDemo.java](code/StartVsRunDemo.java),
+[VirtualThreadsDemo.java](code/VirtualThreadsDemo.java).
 
 ---
 
@@ -984,6 +1015,7 @@ persist(state); // I/O вне lock
 | [DeadlockDemo.java](code/DeadlockDemo.java) | циклический захват двух мониторов |
 | [InterruptHandlingDemo.java](code/InterruptHandlingDemo.java) | `interrupted` vs `isInterrupted`, restore flag |
 | [StartVsRunDemo.java](code/StartVsRunDemo.java) | `start()` vs прямой `run()` |
+| [VirtualThreadsDemo.java](code/VirtualThreadsDemo.java) | virtual threads: один VT и fan-out на I/O-wait |
 | [DoubleCheckedLockingDemo.java](code/DoubleCheckedLockingDemo.java) | DCL + holder idiom |
 | [ThreadPoolRejectionDemo.java](code/ThreadPoolRejectionDemo.java) | полная очередь → `RejectedExecutionException` |
 | [LatchBarrierDemo.java](code/LatchBarrierDemo.java) | `CountDownLatch` и `CyclicBarrier` |
@@ -1057,10 +1089,12 @@ Latch — «подождать события N раз», одноразовый
 
 ### 9. Virtual threads отменяют thread pools?
 
-Не отменяют, меняют экономику. Для блокирующего I/O можно плодить много virtual threads
-(часто one-task-one-thread) вместо пула platform threads на тысячи задач. Пулы и
-семафоры всё ещё нужны, чтобы ограничить доступ к scarce resources (connections, CPU-heavy
-участки). CPU-bound по-прежнему ограничивают число workers ≈ числу ядер.
+Не отменяют — меняют экономику. Для блокирующего I/O можно плодить много VT
+(часто «одна задача — один поток») вместо гигантского пула platform threads.
+Но пулы и семафоры всё ещё нужны: ограничивать connections, внешние API, CPU-heavy
+участки. VT снимают дефицит потоков, не дефицит ресурсов. CPU-bound по-прежнему
+ограничивают число workers ≈ числу ядер. Подробнее — [§4](#4-процесс-поток-green--virtual-threads),
+демо: [VirtualThreadsDemo.java](code/VirtualThreadsDemo.java).
 
 ### 10. `synchronized` или `ReentrantLock` — что сказать на собесе?
 
